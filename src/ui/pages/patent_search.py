@@ -1,7 +1,14 @@
-"""선행특허 검색·등록·비교 화면 (발명 상세 화면 우측/하단에 배치).
+"""선행특허(비슷한 기술) 검색·등록·비교 화면. 발명 상세 화면 안에 접혀 있다.
 
 Phase 2: 수동 등록 + 비교 기록.
 Phase 3: PatentProvider.search를 통한 자동/수동 검색어 검색 + TF-IDF 유사도.
+Phase 4: AI 검색어 생성/번역/요약/비교 초안.
+
+쓰기 동작은 모두 `run_and_rerun`을 거쳐 별도의 짧은 세션에서 커밋까지
+끝낸 뒤 새로고침한다 (이유는 `src/ui/components/actions.py` 참고). 이 화면을
+포함하는 발명 상세 화면 전체가 하나의 읽기용 세션 안에서 그려지기 때문에,
+`with get_session() as session: ... st.rerun()`처럼 그 세션 안에서 바로
+새로고침하면 방금 쓴 내용이 커밋되지 않고 사라진다.
 """
 from __future__ import annotations
 
@@ -19,6 +26,7 @@ from src.patents.providers.factory import PROVIDER_LABELS, available_search_prov
 from src.patents.schemas import IMPORTANCE_VALUES, REVIEW_STATUS_VALUES, ComparisonInput, ManualPatentInput
 from src.patents.service import DuplicatePatentLinkError, PatentService
 from src.similarity.tfidf import calculate_similarity
+from src.ui.components.actions import run_and_rerun
 
 
 def _results_key(invention_id: str) -> str:
@@ -53,13 +61,14 @@ def _render_ai_search_terms(invention_id: str, invention) -> None:
                 st.markdown(f"- CPC 후보: {', '.join(terms.cpc_candidates)}")
             for i, query in enumerate(terms.recommended_queries):
                 if st.button(f"'{query}' 검색어로 사용", key=f"use_query_{invention_id}_{i}"):
+                    # 세션 상태만 바꾸는 순수 UI 동작이라 DB 세션과 무관하다 —
+                    # 곧바로 st.rerun()을 불러도 안전하다.
                     st.session_state[f"query_{invention_id}"] = query
                     st.rerun()
 
 
-def _render_search_section(invention_id: str, service: PatentService, session) -> None:
+def _render_search_section(invention_id: str, invention) -> None:
     settings = get_settings()
-    invention = InventionService(session).get(invention_id)
     invention_text = " ".join(
         filter(
             None,
@@ -71,7 +80,7 @@ def _render_search_section(invention_id: str, service: PatentService, session) -
         )
     )
 
-    st.markdown("**선행특허 검색**")
+    st.markdown("**비슷한 기술 검색**")
     st.caption(
         "유사도는 텍스트 기반 참고 점수이며, 신규성·진보성·특허침해에 대한 "
         "법적 판단이 아닙니다."
@@ -152,16 +161,18 @@ def _render_search_section(invention_id: str, service: PatentService, session) -
                                 country_code=r.country_code,
                                 raw_data_json=r.raw_data_json,
                             )
-                        service.register_from_detail(invention_id, detail)
-                        st.success("선행특허가 발명에 연결되었습니다.")
-                        st.rerun()
+                        run_and_rerun(
+                            lambda session, d=detail: PatentService(
+                                session
+                            ).register_from_detail(invention_id, d)
+                        )
                     except DuplicatePatentLinkError as exc:
                         st.warning(str(exc))
                     except PatentProviderError as exc:
                         st.error(str(exc))
 
 
-def _render_manual_form(invention_id: str, service: PatentService) -> None:
+def _render_manual_form(invention_id: str) -> None:
     with st.expander("특허 수동 등록", expanded=False):
         with st.form(f"manual_patent_form_{invention_id}"):
             title = st.text_input("발명의 명칭 *")
@@ -197,15 +208,16 @@ def _render_manual_form(invention_id: str, service: PatentService) -> None:
                     st.error(e)
             else:
                 try:
-                    service.register_manual(invention_id, data)
-                    st.success("특허가 등록되고 발명에 연결되었습니다. (데이터 출처: 사용자 입력)")
-                    st.rerun()
+                    run_and_rerun(
+                        lambda session: PatentService(session).register_manual(
+                            invention_id, data
+                        )
+                    )
                 except DuplicatePatentLinkError as exc:
                     st.warning(str(exc))
 
 
-def _render_linked_patents(invention_id: str, service: PatentService, session) -> None:
-    links = service.list_for_invention(invention_id)
+def _render_linked_patents(invention_id: str, links) -> None:
     st.subheader(f"연결된 선행특허 ({len(links)}건)")
 
     if not links:
@@ -261,8 +273,11 @@ def _render_linked_patents(invention_id: str, service: PatentService, session) -
                         translated = provider.translate_abstract(
                             patent.abstract_original or "", patent.abstract_language or ""
                         )
-                        service.save_patent_translation(patent.id, translated)
-                        st.rerun()
+                        run_and_rerun(
+                            lambda session, t=translated: PatentService(
+                                session
+                            ).save_patent_translation(patent.id, t)
+                        )
                     except AIProviderError as exc:
                         st.error(f"AI 번역에 실패했습니다.\n\n{exc}")
                 if ai_cols[1].button("AI 요약", key=f"ai_summarize_{link.id}"):
@@ -271,8 +286,11 @@ def _render_linked_patents(invention_id: str, service: PatentService, session) -
                         st.info(warning)
                     try:
                         summary = provider.summarize_patent(patent)
-                        service.save_patent_ai_summary(patent.id, summary)
-                        st.rerun()
+                        run_and_rerun(
+                            lambda session, s=summary: PatentService(
+                                session
+                            ).save_patent_ai_summary(patent.id, s)
+                        )
                     except AIProviderError as exc:
                         st.error(f"AI 요약에 실패했습니다.\n\n{exc}")
                 if ai_cols[2].button("AI 비교 초안 생성", key=f"ai_compare_{link.id}"):
@@ -280,10 +298,19 @@ def _render_linked_patents(invention_id: str, service: PatentService, session) -
                     if warning:
                         st.info(warning)
                     try:
-                        invention = InventionService(session).get(invention_id)
-                        draft = provider.compare_invention_and_patent(invention, patent)
-                        service.save_ai_comparison_draft(link.id, draft.to_dict())
-                        st.rerun()
+                        with get_session() as read_session:
+                            fresh_invention = InventionService(read_session).get(
+                                invention_id
+                            )
+                            draft = provider.compare_invention_and_patent(
+                                fresh_invention, patent
+                            )
+                        draft_dict = draft.to_dict()
+                        run_and_rerun(
+                            lambda session: PatentService(
+                                session
+                            ).save_ai_comparison_draft(link.id, draft_dict)
+                        )
                     except AIProviderError as exc:
                         st.error(f"AI 비교 초안 생성에 실패했습니다.\n\n{exc}")
 
@@ -304,9 +331,11 @@ def _render_linked_patents(invention_id: str, service: PatentService, session) -
                         )
                         st.markdown(f"- 신뢰도(참고용): {draft.get('confidence', 0)}")
                         if st.button("이 초안을 비교 기록에 적용", key=f"apply_draft_{link.id}"):
-                            service.apply_ai_comparison_draft(link.id)
-                            st.success("AI 초안이 비교 기록에 적용되었습니다.")
-                            st.rerun()
+                            run_and_rerun(
+                                lambda session: PatentService(
+                                    session
+                                ).apply_ai_comparison_draft(link.id)
+                            )
 
             st.markdown("---")
             st.markdown("**내 비교 기록**")
@@ -350,35 +379,41 @@ def _render_linked_patents(invention_id: str, service: PatentService, session) -
                 save = st.form_submit_button("비교 기록 저장")
 
             if save:
-                service.update_comparison(
-                    link.id,
-                    ComparisonInput(
-                        similarities=similarities or None,
-                        differences=differences or None,
-                        patent_solved_problem=patent_solved_problem or None,
-                        unsolved_problem=unsolved_problem or None,
-                        differentiation_ideas=differentiation_ideas or None,
-                        additional_research=additional_research or None,
-                        user_notes=user_notes or None,
-                        importance=importance,
-                        review_status=review_status,
-                    ),
+                comparison = ComparisonInput(
+                    similarities=similarities or None,
+                    differences=differences or None,
+                    patent_solved_problem=patent_solved_problem or None,
+                    unsolved_problem=unsolved_problem or None,
+                    differentiation_ideas=differentiation_ideas or None,
+                    additional_research=additional_research or None,
+                    user_notes=user_notes or None,
+                    importance=importance,
+                    review_status=review_status,
                 )
-                st.success("비교 기록이 저장되었습니다.")
-                st.rerun()
+                run_and_rerun(
+                    lambda session: PatentService(session).update_comparison(
+                        link.id, comparison
+                    )
+                )
 
             if st.button("연결 해제", key=f"unlink_{link.id}"):
-                service.delete_link(link.id)
-                st.rerun()
+                run_and_rerun(
+                    lambda session: PatentService(session).delete_link(link.id)
+                )
 
 
 def render(invention_id: str) -> None:
-    st.subheader("선행특허 검색·등록")
+    st.subheader("비슷한 기술 찾아보기")
 
+    # 읽기 전용 세션은 렌더링이 끝날 때까지 열어 둔다. link.patent 같은
+    # 지연 로딩 관계를 화면을 그리는 동안 계속 읽어야 하기 때문이다.
+    # (쓰기는 각 동작이 run_and_rerun을 통해 별도의 짧은 세션에서 처리한다)
     with get_session() as session:
-        service = PatentService(session)
-        _render_search_section(invention_id, service, session)
+        invention = InventionService(session).get(invention_id)
+        links = list(PatentService(session).list_for_invention(invention_id))
+
+        _render_search_section(invention_id, invention)
         st.divider()
-        _render_manual_form(invention_id, service)
+        _render_manual_form(invention_id)
         st.divider()
-        _render_linked_patents(invention_id, service, session)
+        _render_linked_patents(invention_id, links)

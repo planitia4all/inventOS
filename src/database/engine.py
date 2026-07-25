@@ -8,6 +8,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.config.settings import Settings, get_settings
+from src.database.migrations import run_migrations
 from src.database.models import Base
 
 _engine = None
@@ -26,6 +27,8 @@ def init_engine(settings: Settings | None = None):
         connect_args={"check_same_thread": False},
     )
     Base.metadata.create_all(_engine)
+    # 기존 DB에 나중에 추가된 컬럼을 채워 넣는다 (데이터 보존).
+    run_migrations(_engine)
     _SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False)
     return _engine
 

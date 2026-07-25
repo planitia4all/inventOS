@@ -13,11 +13,26 @@ from sqlalchemy.orm import Session
 from src.config.settings import Settings, get_settings
 from src.database.models import Attachment
 
-ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".pdf"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+DOCUMENT_EXTENSIONS = {".pdf"}
+AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg", ".webm"}
+ALLOWED_EXTENSIONS = IMAGE_EXTENSIONS | DOCUMENT_EXTENSIONS | AUDIO_EXTENSIONS
 
 
 class AttachmentError(Exception):
     pass
+
+
+def attachment_kind(filename: str) -> str:
+    """UI가 미리보기 방식을 고르기 위한 분류: image | audio | document | other."""
+    ext = Path(filename).suffix.lower()
+    if ext in IMAGE_EXTENSIONS:
+        return "image"
+    if ext in AUDIO_EXTENSIONS:
+        return "audio"
+    if ext in DOCUMENT_EXTENSIONS:
+        return "document"
+    return "other"
 
 
 class AttachmentService:
@@ -35,7 +50,8 @@ class AttachmentService:
         ext = Path(original_filename).suffix.lower()
         if ext not in ALLOWED_EXTENSIONS:
             raise AttachmentError(
-                f"허용되지 않은 파일 형식입니다: {ext} (PNG, JPG, JPEG, PDF만 가능)"
+                f"허용되지 않은 파일 형식입니다: {ext} "
+                "(사진 PNG/JPG, 문서 PDF, 음성 WAV/MP3/M4A/OGG/WEBM만 가능)"
             )
 
         target_dir = self.settings.attachments_dir / invention_id
@@ -75,3 +91,9 @@ class AttachmentService:
         except OSError:
             pass
         self.session.delete(attachment)
+
+    def delete_by_id(self, attachment_id: str) -> None:
+        """다른 세션에서 조회한 첨부(detached 객체) 대신 id로 안전하게 삭제한다."""
+        attachment = self.session.get(Attachment, attachment_id)
+        if attachment is not None:
+            self.delete(attachment)
