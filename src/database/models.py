@@ -26,19 +26,30 @@ class Invention(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     invention_no: Mapped[str] = mapped_column(String(32), unique=True, nullable=False)
+    # 사용자가 제목을 비워두면 서비스 계층이 메모 첫 문장/날짜로 자동 생성한다.
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     technical_field: Mapped[str | None] = mapped_column(String(200))
+    # 최초로 기록한 원본 메모. AI 정리나 내용 구체화로 덮어쓰지 않는다.
     original_idea: Mapped[str] = mapped_column(Text, nullable=False)
+    # 원본과 분리해서 보관하는 '정리된 발명 내용'
+    refined_content: Mapped[str | None] = mapped_column(Text)
     problem_to_solve: Mapped[str | None] = mapped_column(Text)
     conventional_method: Mapped[str | None] = mapped_column(Text)
     conventional_problems: Mapped[str | None] = mapped_column(Text)
     core_principle: Mapped[str | None] = mapped_column(Text)
+    key_components: Mapped[str | None] = mapped_column(Text)
+    operating_principle: Mapped[str | None] = mapped_column(Text)
+    differentiation: Mapped[str | None] = mapped_column(Text)
     expected_effects: Mapped[str | None] = mapped_column(Text)
     technical_barriers: Mapped[str | None] = mapped_column(Text)
     applicable_industries: Mapped[str | None] = mapped_column(Text)
+    implementation_method: Mapped[str | None] = mapped_column(Text)
+    experiment_notes: Mapped[str | None] = mapped_column(Text)
+    review_notes: Mapped[str | None] = mapped_column(Text)
     keywords: Mapped[list[str]] = mapped_column(JSON, default=list)
     inventor_name: Mapped[str | None] = mapped_column(String(200))
     status: Mapped[str] = mapped_column(String(50), default="아이디어")
+    is_favorite: Mapped[bool] = mapped_column(default=False)
     is_archived: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(

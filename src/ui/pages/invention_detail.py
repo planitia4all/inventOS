@@ -1,197 +1,293 @@
-"""발명 상세(작성/수정) 화면."""
-from __future__ import annotations
+"""발명 상세 화면.
 
-import json
+원본 메모를 맨 위에 그대로 보여주고, 나머지 항목은 내용이 있을 때만
+표시한다. 비어 있는 항목은 버튼을 눌러야 펼쳐진다.
+
+쓰기 동작은 모두 `run_and_rerun`을 거쳐 별도의 짧은 세션에서 커밋까지
+끝낸 뒤 새로고침한다 (이유는 `src/ui/components/actions.py` 참고).
+읽기 전용 표시는 화면 렌더링 동안 열어 두는 공용 세션을 그대로 쓴다.
+"""
+from __future__ import annotations
 
 import streamlit as st
 
-from src.attachments.service import AttachmentError, AttachmentService
+from src.attachments.service import AttachmentError, AttachmentService, attachment_kind
 from src.database.engine import get_session
-from src.inventions.schemas import STATUS_VALUES, InventionInput
-from src.inventions.service import InventionService, invention_to_dict
+from src.drafts.store import DraftStore
+from src.inventions.schemas import DETAIL_GROUPS, FIELD_LABELS, STATUS_VALUES
+from src.inventions.service import InventionService
 from src.reports.markdown_exporter import export_invention_markdown
+from src.ui.components.actions import run_and_rerun
+from src.ui.components.layout import go
 
 
-def _keywords_from_text(text: str) -> list[str]:
-    return [k.strip() for k in text.replace("\n", ",").split(",") if k.strip()]
+def _render_header(invention) -> None:
+    st.title(invention.title)
+    st.caption(
+        f"{invention.invention_no} · 작성 {invention.created_at.strftime('%Y-%m-%d')}"
+        f" · 수정 {invention.updated_at.strftime('%Y-%m-%d')}"
+    )
+
+    cols = st.columns(3)
+    if cols[0].button(
+        "⭐ 즐겨찾기 해제" if invention.is_favorite else "☆ 즐겨찾기",
+        key=f"fav_{invention.id}",
+    ):
+        run_and_rerun(
+            lambda session: InventionService(session).toggle_favorite(invention.id)
+        )
+
+    current_status = (
+        STATUS_VALUES.index(invention.status)
+        if invention.status in STATUS_VALUES
+        else 0
+    )
+    new_status = cols[1].selectbox(
+        "상태", STATUS_VALUES, index=current_status, key=f"status_{invention.id}"
+    )
+    if new_status != invention.status:
+        run_and_rerun(
+            lambda session: InventionService(session).update_fields(
+                invention.id, status=new_status
+            )
+        )
+
+    if cols[2].button("← 홈으로", key=f"back_{invention.id}"):
+        go("home")
+
+
+def _render_original(invention) -> None:
+    st.subheader("원본 아이디어")
+    st.caption("처음 적어둔 내용입니다. 고쳐도 이전 내용은 변경 이력에 남습니다.")
+    st.info(invention.original_idea)
+
+    with st.expander("원본 내용 고치기", expanded=False):
+        edited = st.text_area(
+            "원본 아이디어",
+            value=invention.original_idea,
+            height=180,
+            key=f"orig_edit_{invention.id}",
+            label_visibility="collapsed",
+        )
+        if st.button("원본 저장", key=f"orig_save_{invention.id}"):
+            errors = []
+            if not edited or not edited.strip():
+                errors.append("아이디어 내용을 입력하세요.")
+            if errors:
+                for message in errors:
+                    st.error(message)
+            else:
+                run_and_rerun(
+                    lambda session: InventionService(session).update_original_idea(
+                        invention.id, edited
+                    )
+                )
+
+
+def _render_filled_sections(invention) -> None:
+    filled = [
+        (name, FIELD_LABELS[name][0], (getattr(invention, name) or "").strip())
+        for _, _, fields in DETAIL_GROUPS
+        for name in fields
+        if (getattr(invention, name) or "").strip()
+    ]
+    if not filled:
+        return
+
+    st.subheader("정리한 내용")
+    for _, label, value in filled:
+        with st.container(border=True):
+            st.markdown(f"**{label}**")
+            st.write(value)
+
+
+def _render_group_editors(invention) -> None:
+    st.subheader("내용 채우기")
+    st.caption("필요한 것만 눌러서 채우세요. 한 번에 다 적지 않아도 됩니다.")
+
+    for group_name, description, fields in DETAIL_GROUPS:
+        has_content = any((getattr(invention, f) or "").strip() for f in fields)
+        label = f"{group_name}{' ✓' if has_content else ''}"
+        with st.expander(label, expanded=False):
+            st.caption(description)
+            with st.form(f"group_{invention.id}_{group_name}"):
+                values: dict[str, str] = {}
+                for name in fields:
+                    field_label, help_text = FIELD_LABELS[name]
+                    values[name] = st.text_area(
+                        field_label,
+                        value=getattr(invention, name) or "",
+                        help=help_text or None,
+                        height=130,
+                        key=f"f_{invention.id}_{name}",
+                    )
+                saved = st.form_submit_button("저장")
+            if saved:
+                payload = {k: (v or None) for k, v in values.items()}
+                run_and_rerun(
+                    lambda session: InventionService(session).update_fields(
+                        invention.id, **payload
+                    )
+                )
+
+
+def _render_attachments(invention) -> None:
+    with get_session() as session:
+        attachments = AttachmentService(session).list_for_invention(invention.id)
+
+    with st.expander(f"사진·파일 ({len(attachments)}건)", expanded=False):
+        uploaded = st.file_uploader(
+            "파일 추가",
+            type=["png", "jpg", "jpeg", "pdf", "wav", "mp3", "m4a", "ogg", "webm"],
+            accept_multiple_files=True,
+            key=f"att_up_{invention.id}",
+        )
+        photo = st.camera_input("사진 찍기", key=f"att_cam_{invention.id}")
+        voice = st.audio_input("음성 메모", key=f"att_voice_{invention.id}")
+
+        if st.button("첨부 저장", key=f"att_save_{invention.id}"):
+            items = [item for item in (photo, voice, *list(uploaded or [])) if item]
+            if not items:
+                st.warning("첨부할 파일을 먼저 선택하세요.")
+            else:
+                problems: list[str] = []
+
+                def _save_all(session, items=items, problems=problems):
+                    service = AttachmentService(session)
+                    for item in items:
+                        name = getattr(item, "name", None) or "voice-memo.wav"
+                        try:
+                            service.save(
+                                invention.id,
+                                name,
+                                item.getvalue(),
+                                content_type=getattr(item, "type", None),
+                            )
+                        except AttachmentError as exc:
+                            problems.append(f"{name}: {exc}")
+
+                run_and_rerun(_save_all)
+
+        for att in attachments:
+            kind = attachment_kind(att.original_filename)
+            with get_session() as session:
+                path = AttachmentService(session).resolve_path(att)
+            st.markdown(f"**{att.original_filename}**")
+            if path.exists():
+                if kind == "image":
+                    st.image(str(path), width=320)
+                elif kind == "audio":
+                    st.audio(str(path))
+            if st.button("삭제", key=f"att_del_{att.id}"):
+                run_and_rerun(
+                    lambda session, att_id=att.id: AttachmentService(
+                        session
+                    ).delete_by_id(att_id)
+                )
+
+
+def _render_history(invention) -> None:
+    with get_session() as session:
+        revisions = InventionService(session).list_revisions(invention.id)
+
+    with st.expander(f"변경 이력 ({len(revisions)}건)", expanded=False):
+        note = st.text_input("메모", key=f"rev_note_{invention.id}")
+        if st.button("현재 내용을 버전으로 저장", key=f"rev_save_{invention.id}"):
+            run_and_rerun(
+                lambda session: InventionService(session).save_revision(
+                    invention.id, change_note=note or None
+                )
+            )
+
+        if not revisions:
+            st.caption("아직 저장된 이전 버전이 없습니다.")
+            return
+
+        for rev in revisions:
+            st.markdown(
+                f"**v{rev.revision_no}** · {rev.created_at.strftime('%Y-%m-%d %H:%M')}"
+                f" · {rev.change_note or '메모 없음'}"
+            )
+            snapshot_original = (rev.snapshot_json or {}).get("original_idea", "")
+            if snapshot_original:
+                st.caption("그때의 원본 아이디어")
+                st.text(snapshot_original)
+
+
+def _render_export(invention) -> None:
+    with st.expander("내보내기", expanded=False):
+        markdown = export_invention_markdown(invention, list(invention.patent_links))
+        st.download_button(
+            "Markdown 파일로 저장",
+            data=markdown.encode("utf-8"),
+            file_name=f"{invention.invention_no}.md",
+            mime="text/markdown",
+            key=f"md_{invention.id}",
+        )
+
+
+def _render_danger_zone(invention) -> None:
+    with st.expander("보관 / 삭제", expanded=False):
+        if st.button(
+            "보관 해제" if invention.is_archived else "보관하기",
+            key=f"arch_{invention.id}",
+        ):
+            run_and_rerun(
+                lambda session: InventionService(session).set_archived(
+                    invention.id, not invention.is_archived
+                )
+            )
+
+        confirm_key = f"confirm_del_{invention.id}"
+        if st.button("삭제", key=f"del_{invention.id}"):
+            st.session_state[confirm_key] = True
+
+        if st.session_state.get(confirm_key):
+            st.warning(f"'{invention.title}'을(를) 삭제합니다. 되돌릴 수 없습니다.")
+            cols = st.columns(2)
+            if cols[0].button("삭제 확정", key=f"del_ok_{invention.id}"):
+                with get_session() as session:
+                    InventionService(session).delete(invention.id)
+                st.session_state.pop(confirm_key, None)
+                DraftStore().clear(f"detail_{invention.id}")
+                go("home")
+            if cols[1].button("취소", key=f"del_no_{invention.id}"):
+                st.session_state.pop(confirm_key, None)
+                st.rerun()
 
 
 def render(invention_id: str | None) -> None:
-    with get_session() as session:
-        service = InventionService(session)
-        invention = service.get(invention_id) if invention_id else None
+    if not invention_id:
+        st.info("먼저 아이디어를 선택하거나 새로 기록하세요.")
+        if st.button("새 아이디어 기록", key="detail_to_capture"):
+            go("capture")
+        return
 
-        if invention_id and invention is None:
-            st.error("발명을 찾을 수 없습니다.")
+    with get_session() as session:
+        invention = InventionService(session).get(invention_id)
+        if invention is None:
+            st.error("해당 아이디어를 찾을 수 없습니다.")
+            if st.button("홈으로", key="detail_missing_home"):
+                go("home")
             return
 
-        header = f"{invention.invention_no} / {invention.title}" if invention else "새 발명"
-        st.header(header)
-        if invention:
+        _render_header(invention)
+        st.divider()
+        _render_original(invention)
+        _render_filled_sections(invention)
+        st.divider()
+        _render_group_editors(invention)
+        st.divider()
+        _render_attachments(invention)
+
+        with st.expander("비슷한 기술 찾아보기", expanded=False):
             st.caption(
-                f"상태: {invention.status} · 기술분야: {invention.technical_field or '(미상)'} · "
-                f"작성일: {invention.created_at.strftime('%Y-%m-%d') if invention.created_at else '-'} · "
-                f"최근 수정일: {invention.updated_at.strftime('%Y-%m-%d') if invention.updated_at else '-'} · "
-                f"버전: v{invention.version}"
+                "이미 나와 있는 비슷한 기술(선행특허)을 찾아 내 아이디어와 비교해 둡니다."
             )
+            from src.ui.pages import patent_search
 
-        left, right = st.columns([3, 2])
+            patent_search.render(invention.id)
 
-        with left:
-            st.subheader("발명 내용")
-            with st.form("invention_form", clear_on_submit=False):
-                title = st.text_input("발명 제목 *", value=invention.title if invention else "")
-                technical_field = st.text_input(
-                    "기술 분야", value=invention.technical_field if invention else ""
-                )
-                original_idea = st.text_area(
-                    "최초 아이디어 *",
-                    value=invention.original_idea if invention else "",
-                    height=120,
-                )
-                problem_to_solve = st.text_area(
-                    "해결하려는 문제",
-                    value=invention.problem_to_solve if invention else "",
-                )
-                conventional_method = st.text_area(
-                    "기존 방식", value=invention.conventional_method if invention else ""
-                )
-                conventional_problems = st.text_area(
-                    "기존 방식의 문제점",
-                    value=invention.conventional_problems if invention else "",
-                )
-                core_principle = st.text_area(
-                    "핵심 해결 원리", value=invention.core_principle if invention else ""
-                )
-                expected_effects = st.text_area(
-                    "예상 효과", value=invention.expected_effects if invention else ""
-                )
-                technical_barriers = st.text_area(
-                    "예상 기술 장벽", value=invention.technical_barriers if invention else ""
-                )
-                applicable_industries = st.text_area(
-                    "적용 가능한 산업",
-                    value=invention.applicable_industries if invention else "",
-                )
-                keywords_text = st.text_input(
-                    "관련 키워드 (쉼표로 구분)",
-                    value=", ".join(invention.keywords) if invention else "",
-                )
-                inventor_name = st.text_input(
-                    "작성자", value=invention.inventor_name if invention else ""
-                )
-                status = st.selectbox(
-                    "상태",
-                    STATUS_VALUES,
-                    index=STATUS_VALUES.index(invention.status)
-                    if invention and invention.status in STATUS_VALUES
-                    else 0,
-                )
-
-                submitted = st.form_submit_button("저장", type="primary")
-
-            if submitted:
-                data = InventionInput(
-                    title=title,
-                    original_idea=original_idea,
-                    technical_field=technical_field or None,
-                    problem_to_solve=problem_to_solve or None,
-                    conventional_method=conventional_method or None,
-                    conventional_problems=conventional_problems or None,
-                    core_principle=core_principle or None,
-                    expected_effects=expected_effects or None,
-                    technical_barriers=technical_barriers or None,
-                    applicable_industries=applicable_industries or None,
-                    keywords=_keywords_from_text(keywords_text),
-                    inventor_name=inventor_name or None,
-                    status=status,
-                )
-                errors = data.validate()
-                if errors:
-                    for e in errors:
-                        st.error(e)
-                else:
-                    try:
-                        if invention:
-                            invention = service.update(invention.id, data)
-                            st.success("저장되었습니다.")
-                        else:
-                            invention = service.create(data)
-                            st.session_state.current_invention_id = invention.id
-                            st.success(f"새 발명이 등록되었습니다: {invention.invention_no}")
-                        st.rerun()
-                    except ValueError as exc:
-                        st.error(str(exc))
-
-            if invention:
-                st.divider()
-                st.subheader("버전 관리")
-                change_note = st.text_input("변경 메모", key="revision_note")
-                if st.button("버전 저장"):
-                    service.save_revision(invention.id, change_note=change_note or None)
-                    st.success("현재 상태가 새 버전으로 저장되었습니다.")
-                    st.rerun()
-
-                revisions = service.list_revisions(invention.id)
-                if revisions:
-                    with st.expander(f"버전 이력 ({len(revisions)}건)"):
-                        for rev in revisions:
-                            st.markdown(
-                                f"- v{rev.revision_no} · "
-                                f"{rev.created_at.strftime('%Y-%m-%d %H:%M')} · "
-                                f"{rev.change_note or '(메모 없음)'}"
-                            )
-
-                st.divider()
-                st.subheader("첨부파일")
-                attachment_service = AttachmentService(session)
-                uploaded = st.file_uploader(
-                    "이미지 또는 PDF 첨부", type=["png", "jpg", "jpeg", "pdf"]
-                )
-                if uploaded is not None and st.button("첨부 저장"):
-                    try:
-                        attachment_service.save(
-                            invention.id,
-                            uploaded.name,
-                            uploaded.getvalue(),
-                            content_type=uploaded.type,
-                        )
-                        st.success("첨부파일이 저장되었습니다.")
-                        st.rerun()
-                    except AttachmentError as exc:
-                        st.error(str(exc))
-
-                attachments = attachment_service.list_for_invention(invention.id)
-                for att in attachments:
-                    c1, c2 = st.columns([4, 1])
-                    c1.markdown(f"📎 {att.original_filename}")
-                    if c2.button("삭제", key=f"del_att_{att.id}"):
-                        attachment_service.delete(att)
-                        st.rerun()
-
-                st.divider()
-                st.subheader("내보내기")
-                json_bytes = json.dumps(
-                    invention_to_dict(invention), ensure_ascii=False, indent=2
-                ).encode("utf-8")
-                st.download_button(
-                    "JSON 내보내기",
-                    data=json_bytes,
-                    file_name=f"{invention.invention_no}.json",
-                    mime="application/json",
-                )
-                md = export_invention_markdown(invention, list(invention.patent_links))
-                st.download_button(
-                    "Markdown 보고서 내보내기",
-                    data=md.encode("utf-8"),
-                    file_name=f"{invention.invention_no}.md",
-                    mime="text/markdown",
-                )
-
-        with right:
-            if invention:
-                from src.ui.pages import patent_search
-
-                patent_search.render(invention.id)
-            else:
-                st.info("발명을 먼저 저장하면 선행특허 검색을 사용할 수 있습니다.")
+        _render_history(invention)
+        _render_export(invention)
+        _render_danger_zone(invention)

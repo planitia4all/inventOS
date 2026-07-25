@@ -55,8 +55,9 @@ def render() -> None:
         )
 
     st.divider()
-    st.subheader("백업 / 복원")
+    st.subheader("백업")
     st.caption(
-        "발명 목록 화면에서 발명별로 JSON을 내보낼 수 있습니다. "
-        "전체 백업/복원 기능은 이후 Phase에서 확장될 예정입니다."
+        f"기록한 모든 내용은 `{settings.data_dir}` 폴더에 저장됩니다. "
+        "이 폴더를 복사해 두면 전체 백업이 됩니다. "
+        "개별 아이디어는 상세 화면의 '내보내기'에서 Markdown 파일로 저장할 수 있습니다."
     )
