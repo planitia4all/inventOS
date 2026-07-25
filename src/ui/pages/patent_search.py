@@ -1,7 +1,7 @@
 """선행특허 검색·등록·비교 화면 (발명 상세 화면 우측/하단에 배치).
 
 Phase 2: 수동 등록 + 비교 기록.
-Phase 3에서 자동 검색(PatentProvider.search)이 이 파일 상단에 추가된다.
+Phase 3: PatentProvider.search를 통한 자동/수동 검색어 검색 + TF-IDF 유사도.
 """
 from __future__ import annotations
 
@@ -9,9 +9,120 @@ from datetime import date
 
 import streamlit as st
 
+from src.config.settings import get_settings
 from src.database.engine import get_session
+from src.inventions.service import InventionService
+from src.patents.providers.base import PatentDetail, PatentProviderError
+from src.patents.providers.factory import PROVIDER_LABELS, available_search_providers, get_provider
 from src.patents.schemas import IMPORTANCE_VALUES, REVIEW_STATUS_VALUES, ComparisonInput, ManualPatentInput
 from src.patents.service import DuplicatePatentLinkError, PatentService
+from src.similarity.tfidf import calculate_similarity
+
+
+def _results_key(invention_id: str) -> str:
+    return f"patent_search_results_{invention_id}"
+
+
+def _render_search_section(invention_id: str, service: PatentService, session) -> None:
+    settings = get_settings()
+    invention = InventionService(session).get(invention_id)
+    invention_text = " ".join(
+        filter(
+            None,
+            [
+                invention.original_idea if invention else "",
+                invention.problem_to_solve if invention else "",
+                invention.core_principle if invention else "",
+            ],
+        )
+    )
+
+    st.markdown("**선행특허 검색**")
+    st.caption(
+        "유사도는 텍스트 기반 참고 점수이며, 신규성·진보성·특허침해에 대한 "
+        "법적 판단이 아닙니다."
+    )
+
+    provider_keys = available_search_providers(settings)
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        query = st.text_input(
+            "검색어 (직접 입력)", key=f"query_{invention_id}",
+            help="쉼표로 여러 검색어를 구분할 수 있습니다.",
+        )
+    with col2:
+        provider_key = st.selectbox(
+            "데이터 공급자",
+            provider_keys,
+            format_func=lambda k: PROVIDER_LABELS.get(k, k),
+            key=f"provider_{invention_id}",
+        )
+
+    if st.button("검색", key=f"search_btn_{invention_id}"):
+        if not query.strip():
+            st.warning("검색어를 입력하세요.")
+        else:
+            try:
+                provider = get_provider(provider_key, settings)
+                results = provider.search(query.strip(), limit=settings.default_search_limit)
+                scored = []
+                for r in results:
+                    score = calculate_similarity(
+                        invention_text, r.title, r.abstract_snippet or ""
+                    )
+                    scored.append((score, r))
+                scored.sort(key=lambda pair: pair[0], reverse=True)
+                st.session_state[_results_key(invention_id)] = scored
+                if not scored:
+                    st.info("검색 결과가 없습니다.")
+            except PatentProviderError as exc:
+                st.error(
+                    f"특허 검색 서비스를 사용할 수 없습니다.\n\n{exc}\n\n"
+                    "발명 내용은 정상적으로 저장되었습니다. API 설정을 확인하거나 "
+                    "특허를 수동으로 등록할 수 있습니다."
+                )
+
+    scored_results = st.session_state.get(_results_key(invention_id), [])
+    if scored_results:
+        st.caption(f"검색 결과 {len(scored_results)}건 (유사도 높은 순)")
+        for score, r in scored_results:
+            with st.container(border=True):
+                cols = st.columns([5, 1, 1])
+                cols[0].markdown(f"**{r.title}**")
+                cols[0].caption(
+                    f"{r.publication_number} · {r.applicant or '(출원인 미상)'} · "
+                    f"{r.country_code or '-'} · 우선일 "
+                    f"{r.priority_date.isoformat() if r.priority_date else '(미상)'} · "
+                    f"공급자: {PROVIDER_LABELS.get(r.provider, r.provider)}"
+                )
+                snippet = (r.abstract_snippet or "")[:200]
+                if snippet:
+                    cols[0].write(snippet + ("..." if len(r.abstract_snippet or "") >= 200 else ""))
+                cols[1].metric("유사도", f"{score:.0f}")
+                if cols[2].button("연결", key=f"link_{invention_id}_{r.publication_number}"):
+                    try:
+                        provider = get_provider(r.provider, settings)
+                        try:
+                            detail = provider.get_detail(r.publication_number)
+                        except (PatentProviderError, NotImplementedError, LookupError):
+                            detail = PatentDetail(
+                                provider=r.provider,
+                                provider_document_id=r.provider_document_id,
+                                publication_number=r.publication_number,
+                                title=r.title,
+                                abstract_original=r.abstract_snippet,
+                                applicant=r.applicant,
+                                priority_date=r.priority_date,
+                                country_code=r.country_code,
+                                raw_data_json=r.raw_data_json,
+                            )
+                        service.register_from_detail(invention_id, detail)
+                        st.success("선행특허가 발명에 연결되었습니다.")
+                        st.rerun()
+                    except DuplicatePatentLinkError as exc:
+                        st.warning(str(exc))
+                    except PatentProviderError as exc:
+                        st.error(str(exc))
 
 
 def _render_manual_form(invention_id: str, service: PatentService) -> None:
@@ -173,6 +284,8 @@ def render(invention_id: str) -> None:
 
     with get_session() as session:
         service = PatentService(session)
+        _render_search_section(invention_id, service, session)
+        st.divider()
         _render_manual_form(invention_id, service)
         st.divider()
         _render_linked_patents(invention_id, service)
