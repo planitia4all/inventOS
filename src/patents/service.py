@@ -139,3 +139,44 @@ class PatentService:
         if link is None:
             raise LookupError(f"연결 정보를 찾을 수 없습니다: {link_id}")
         self.repo.delete_link(link)
+
+    def save_patent_translation(self, patent_id: str, translated_ko: str) -> PatentDocument:
+        patent = self.repo.get(patent_id)
+        if patent is None:
+            raise LookupError(f"특허를 찾을 수 없습니다: {patent_id}")
+        patent.abstract_translated_ko = translated_ko
+        self.session.flush()
+        return patent
+
+    def save_patent_ai_summary(self, patent_id: str, summary: str) -> PatentDocument:
+        patent = self.repo.get(patent_id)
+        if patent is None:
+            raise LookupError(f"특허를 찾을 수 없습니다: {patent_id}")
+        patent.abstract_ai_summary = summary
+        self.session.flush()
+        return patent
+
+    def save_ai_comparison_draft(self, link_id: str, draft: dict) -> InventionPatentLink:
+        """AI 비교 초안을 ai_comparison_json에만 저장한다 (아직 확정 저장 아님)."""
+        link = self.repo.get_link(link_id)
+        if link is None:
+            raise LookupError(f"연결 정보를 찾을 수 없습니다: {link_id}")
+        link.ai_comparison_json = draft
+        self.session.flush()
+        return link
+
+    def apply_ai_comparison_draft(self, link_id: str) -> InventionPatentLink:
+        """사용자가 검토 후 '적용'을 눌렀을 때만 초안을 실제 비교 기록에 반영한다."""
+        link = self.repo.get_link(link_id)
+        if link is None:
+            raise LookupError(f"연결 정보를 찾을 수 없습니다: {link_id}")
+        if not link.ai_comparison_json:
+            raise ValueError("적용할 AI 비교 초안이 없습니다.")
+
+        draft = link.ai_comparison_json
+        link.similarities = "\n".join(draft.get("similarities", []))
+        link.differences = "\n".join(draft.get("differences", []))
+        link.differentiation_ideas = "\n".join(draft.get("possible_differentiators", []))
+        link.additional_research = "\n".join(draft.get("additional_search_terms", []))
+        self.session.flush()
+        return link

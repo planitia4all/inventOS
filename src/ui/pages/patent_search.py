@@ -9,6 +9,8 @@ from datetime import date
 
 import streamlit as st
 
+from src.ai.base import AIProviderError
+from src.ai.providers.factory import get_ai_provider
 from src.config.settings import get_settings
 from src.database.engine import get_session
 from src.inventions.service import InventionService
@@ -21,6 +23,38 @@ from src.similarity.tfidf import calculate_similarity
 
 def _results_key(invention_id: str) -> str:
     return f"patent_search_results_{invention_id}"
+
+
+def _render_ai_search_terms(invention_id: str, invention) -> None:
+    settings = get_settings()
+    if st.button("AI 검색어 생성", key=f"ai_terms_btn_{invention_id}"):
+        provider, warning = get_ai_provider(settings)
+        if warning:
+            st.info(warning)
+        try:
+            terms = provider.generate_search_terms(invention)
+            st.session_state[f"ai_terms_{invention_id}"] = terms
+        except AIProviderError as exc:
+            st.error(
+                f"AI 검색어 생성에 실패했습니다.\n\n{exc}\n\n수동으로 검색어를 입력할 수 있습니다."
+            )
+
+    terms = st.session_state.get(f"ai_terms_{invention_id}")
+    if terms:
+        with st.expander("AI 생성 검색어 (선택 시 검색어에 적용)", expanded=True):
+            st.caption("AI 생성 결과")
+            if terms.korean_keywords:
+                st.markdown(f"- 한국어 키워드: {', '.join(terms.korean_keywords)}")
+            if terms.english_keywords:
+                st.markdown(f"- 영어 키워드: {', '.join(terms.english_keywords)}")
+            if terms.ipc_candidates:
+                st.markdown(f"- IPC 후보: {', '.join(terms.ipc_candidates)}")
+            if terms.cpc_candidates:
+                st.markdown(f"- CPC 후보: {', '.join(terms.cpc_candidates)}")
+            for i, query in enumerate(terms.recommended_queries):
+                if st.button(f"'{query}' 검색어로 사용", key=f"use_query_{invention_id}_{i}"):
+                    st.session_state[f"query_{invention_id}"] = query
+                    st.rerun()
 
 
 def _render_search_section(invention_id: str, service: PatentService, session) -> None:
@@ -42,6 +76,8 @@ def _render_search_section(invention_id: str, service: PatentService, session) -
         "유사도는 텍스트 기반 참고 점수이며, 신규성·진보성·특허침해에 대한 "
         "법적 판단이 아닙니다."
     )
+
+    _render_ai_search_terms(invention_id, invention)
 
     provider_keys = available_search_providers(settings)
     col1, col2 = st.columns([3, 1])
@@ -168,7 +204,7 @@ def _render_manual_form(invention_id: str, service: PatentService) -> None:
                     st.warning(str(exc))
 
 
-def _render_linked_patents(invention_id: str, service: PatentService) -> None:
+def _render_linked_patents(invention_id: str, service: PatentService, session) -> None:
     links = service.list_for_invention(invention_id)
     st.subheader(f"연결된 선행특허 ({len(links)}건)")
 
@@ -214,6 +250,63 @@ def _render_linked_patents(invention_id: str, service: PatentService) -> None:
                 if patent.abstract_ai_summary:
                     st.caption("AI 생성 요약")
                     st.write(patent.abstract_ai_summary)
+
+                ai_cols = st.columns(3)
+                settings = get_settings()
+                if ai_cols[0].button("AI 번역", key=f"ai_translate_{link.id}"):
+                    provider, warning = get_ai_provider(settings)
+                    if warning:
+                        st.info(warning)
+                    try:
+                        translated = provider.translate_abstract(
+                            patent.abstract_original or "", patent.abstract_language or ""
+                        )
+                        service.save_patent_translation(patent.id, translated)
+                        st.rerun()
+                    except AIProviderError as exc:
+                        st.error(f"AI 번역에 실패했습니다.\n\n{exc}")
+                if ai_cols[1].button("AI 요약", key=f"ai_summarize_{link.id}"):
+                    provider, warning = get_ai_provider(settings)
+                    if warning:
+                        st.info(warning)
+                    try:
+                        summary = provider.summarize_patent(patent)
+                        service.save_patent_ai_summary(patent.id, summary)
+                        st.rerun()
+                    except AIProviderError as exc:
+                        st.error(f"AI 요약에 실패했습니다.\n\n{exc}")
+                if ai_cols[2].button("AI 비교 초안 생성", key=f"ai_compare_{link.id}"):
+                    provider, warning = get_ai_provider(settings)
+                    if warning:
+                        st.info(warning)
+                    try:
+                        invention = InventionService(session).get(invention_id)
+                        draft = provider.compare_invention_and_patent(invention, patent)
+                        service.save_ai_comparison_draft(link.id, draft.to_dict())
+                        st.rerun()
+                    except AIProviderError as exc:
+                        st.error(f"AI 비교 초안 생성에 실패했습니다.\n\n{exc}")
+
+                if link.ai_comparison_json:
+                    with st.expander("AI 생성 비교 초안 (검토 후 적용 필요)", expanded=True):
+                        draft = link.ai_comparison_json
+                        st.caption(
+                            "AI 생성 초안 — 신규성·진보성에 대한 법적 판단이 아닌 참고용입니다."
+                        )
+                        st.markdown(f"- 같은 점: {'; '.join(draft.get('similarities', []))}")
+                        st.markdown(f"- 다른 점: {'; '.join(draft.get('differences', []))}")
+                        st.markdown(
+                            f"- 선행특허 핵심: {draft.get('prior_patent_core', '')}"
+                        )
+                        st.markdown(
+                            "- 차별화 아이디어: "
+                            + "; ".join(draft.get("possible_differentiators", []))
+                        )
+                        st.markdown(f"- 신뢰도(참고용): {draft.get('confidence', 0)}")
+                        if st.button("이 초안을 비교 기록에 적용", key=f"apply_draft_{link.id}"):
+                            service.apply_ai_comparison_draft(link.id)
+                            st.success("AI 초안이 비교 기록에 적용되었습니다.")
+                            st.rerun()
 
             st.markdown("---")
             st.markdown("**내 비교 기록**")
@@ -288,4 +381,4 @@ def render(invention_id: str) -> None:
         st.divider()
         _render_manual_form(invention_id, service)
         st.divider()
-        _render_linked_patents(invention_id, service)
+        _render_linked_patents(invention_id, service, session)

@@ -100,6 +100,40 @@ def test_update_comparison_fields(db_session):
     assert updated.review_status == "검토 완료"
 
 
+def test_ai_comparison_draft_not_applied_until_apply_called(db_session):
+    invention = make_invention(db_session)
+    service = PatentService(db_session)
+    link = service.register_manual(invention.id, make_patent_input())
+
+    draft = {
+        "similarities": ["같은 점 A"],
+        "differences": ["다른 점 B"],
+        "prior_patent_core": "핵심",
+        "possible_differentiators": ["차별화 C"],
+        "technical_risks": [],
+        "additional_search_terms": [],
+        "confidence": 70,
+    }
+    service.save_ai_comparison_draft(link.id, draft)
+
+    unchanged = service.repo.get_link(link.id)
+    assert unchanged.similarities is None
+    assert unchanged.ai_comparison_json == draft
+
+    applied = service.apply_ai_comparison_draft(link.id)
+    assert applied.similarities == "같은 점 A"
+    assert applied.differences == "다른 점 B"
+    assert applied.differentiation_ideas == "차별화 C"
+
+
+def test_apply_ai_comparison_draft_without_draft_raises(db_session):
+    invention = make_invention(db_session)
+    service = PatentService(db_session)
+    link = service.register_manual(invention.id, make_patent_input())
+    with pytest.raises(ValueError):
+        service.apply_ai_comparison_draft(link.id)
+
+
 def test_delete_link_removes_from_invention_but_keeps_patent(db_session):
     invention = make_invention(db_session)
     service = PatentService(db_session)
