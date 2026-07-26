@@ -82,6 +82,28 @@ def test_factory_falls_back_to_mock_on_unknown_provider():
     assert warning is not None
 
 
+def test_factory_openai_shows_planned_not_error_message():
+    """openai는 .env/설정 화면에 자리는 있지만 아직 미구현이다 — Mock으로
+    대체되되, "지원하지 않는 Provider" 같은 일반 오류가 아니라 "향후 지원
+    예정"이라는 걸 명확히 알려줘야 한다(설정과 실제 지원 범위 불일치 방지)."""
+    settings = Settings(ai_provider="openai", openai_api_key="sk-test")
+    provider, warning = get_ai_provider(settings)
+    assert provider.name == "mock"
+    assert warning is not None
+    assert "지원하지 않습니다" in warning
+    assert "예정" in warning
+
+
+def test_factory_anthropic_empty_model_falls_back_with_clear_reason():
+    settings = Settings(
+        ai_provider="anthropic", anthropic_api_key="sk-ant-test", anthropic_model=""
+    )
+    provider, warning = get_ai_provider(settings)
+    assert provider.name == "mock"
+    assert warning is not None
+    assert "모델 ID" in warning
+
+
 def test_factory_uses_mock_by_default():
     settings = Settings(ai_provider="mock")
     provider, warning = get_ai_provider(settings)

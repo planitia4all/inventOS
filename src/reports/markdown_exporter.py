@@ -1,7 +1,24 @@
 """발명 노트를 Markdown 보고서로 변환한다."""
 from __future__ import annotations
 
+import re
+
 from src.database.models import Invention, InventionPatentLink
+
+# Windows에서 금지된 문자(< > : " / \ | ? *) + 제어문자.
+_UNSAFE_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def safe_filename(name: str, fallback: str = "untitled") -> str:
+    """내보내기 파일명에서 Windows 금지 문자를 제거한다.
+
+    현재 발명번호(INV-2026-00001 형식, 항상 서버가 만들고 사용자가 직접
+    입력할 수 없음) 기반 파일명은 이 문자들을 포함할 수 없어 실질적으로는
+    항상 안전하지만, 나중에 제목 등 사용자 입력 기반 파일명을 쓰게 되더라도
+    안전하도록 내보내기 경로에 방어적으로 적용해 둔다.
+    """
+    cleaned = _UNSAFE_FILENAME_CHARS.sub("_", name).strip().strip(".")
+    return cleaned or fallback
 
 # (제목, 필드명) 순서대로 출력한다. 비어 있으면 표시만 하고 넘어간다.
 _SECTIONS: list[tuple[str, str]] = [

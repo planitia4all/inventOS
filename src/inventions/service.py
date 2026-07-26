@@ -12,6 +12,7 @@ import logging
 import re
 from datetime import datetime, timezone
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.database.models import Invention, InventionRevision
@@ -24,6 +25,7 @@ from src.timeline.service import TimelineService
 logger = logging.getLogger(__name__)
 
 _TITLE_MAX_LEN = 40
+_INVENTION_NO_RETRY_LIMIT = 3
 
 # invention_to_dict / update 에서 함께 다루는 본문 필드
 _CONTENT_FIELDS = (
@@ -231,14 +233,32 @@ class InventionService:
         title: str = "",
         status: str = DEFAULT_STATUS,
     ) -> Invention:
+        """발명번호를 계산해 새 Invention을 만든다.
+
+        `next_invention_no()`는 잠금 없이 max+1을 계산하므로, 더블클릭이나
+        여러 탭/세션에서 동시에 저장하면 같은 번호를 계산할 수 있다.
+        `invention_no`의 UNIQUE 제약이 실제 중복 저장은 막아 주지만, 그대로
+        두면 사용자에게 원문 IntegrityError가 노출된다 — 여기서 감지해
+        번호를 다시 계산해 재시도한다(최대 3회).
+        """
         year = datetime.now(timezone.utc).year
-        invention = Invention(
-            invention_no=self.repo.next_invention_no(year),
-            title=(title or "").strip() or generate_title(original_idea),
-            original_idea=original_idea,
-            status=status,
-        )
-        return self.repo.add(invention)
+        last_error: IntegrityError | None = None
+        for _ in range(_INVENTION_NO_RETRY_LIMIT):
+            invention = Invention(
+                invention_no=self.repo.next_invention_no(year),
+                title=(title or "").strip() or generate_title(original_idea),
+                original_idea=original_idea,
+                status=status,
+            )
+            try:
+                return self.repo.add(invention)
+            except IntegrityError as exc:
+                self.session.rollback()
+                last_error = exc
+                logger.warning("발명번호 충돌을 감지해 다시 계산합니다: %s", exc)
+        raise RuntimeError(
+            "발명번호를 생성하지 못했습니다. 잠시 후 다시 시도해 주세요."
+        ) from last_error
 
     # ------------------------------------------------------------------
     # 수정
@@ -425,7 +445,65 @@ class InventionService:
     # ------------------------------------------------------------------
     # 상태 변경
     # ------------------------------------------------------------------
-    def delete(self, invention_id: str) -> None:
+    def delete(self, invention_id: str) -> Invention:
+        """휴지통으로 이동한다(소프트 삭제) — 기본 동작이자 유일하게 UI
+        삭제 버튼에서 바로 실행되는 동작이다. 실제 데이터는 전혀 지우지
+        않고, 목록/검색 기본 범위에서만 숨긴다. `restore()`로 되돌릴 수
+        있고, 정말로 영구 삭제하려면 `purge()`를 별도로 호출해야 한다."""
+        invention = self._require(invention_id)
+        invention.deleted_at = datetime.now(timezone.utc)
+        self.session.flush()
+        self.timeline.log(invention.id, "moved_to_trash", description=invention.title)
+        self.search_index.remove(invention_id)
+        return invention
+
+    def list_trashed(self) -> list[Invention]:
+        return self.repo.list_trashed()
+
+    def restore(self, invention_id: str) -> Invention:
+        """휴지통에서 되돌린다. 목록/검색에 다시 나타난다."""
+        invention = self._require(invention_id)
+        invention.deleted_at = None
+        self.session.flush()
+        self.timeline.log(invention.id, "restored_from_trash", description=invention.title)
+        self.search_index.reindex_invention(invention.id)
+        return invention
+
+    def purge_impact(self, invention_id: str) -> dict[str, int]:
+        """영구 삭제 전에 무엇이 함께 사라지는지 사용자에게 보여주기 위한 개수."""
+        from src.database.models import (
+            Attachment,
+            Experiment,
+            InventionAIResult,
+            InventionEvent,
+            InventionPatentLink,
+            InventionRevision,
+        )
+
+        def count(model) -> int:
+            return (
+                self.session.query(model)
+                .filter(model.invention_id == invention_id)
+                .count()
+            )
+
+        return {
+            "experiments": count(Experiment),
+            "attachments": count(Attachment),
+            "ai_results": count(InventionAIResult),
+            "patent_links": count(InventionPatentLink),
+            "revisions": count(InventionRevision),
+            "timeline_events": count(InventionEvent),
+            "children": len(self.repo.list_children(invention_id)),
+        }
+
+    def purge(self, invention_id: str) -> None:
+        """실제로 영구 삭제한다 — 되돌릴 수 없다.
+
+        휴지통에 있는 발명에만 쓰도록 설계되어 있다(UI는 휴지통 화면에서만
+        이 동작을 연결한다). 파생된 자식은 지워지지 않고 부모 연결만
+        끊긴다(SET NULL) — `delete()`와 마찬가지다.
+        """
         self.repo.delete(self._require(invention_id))
         self.search_index.remove(invention_id)
 

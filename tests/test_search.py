@@ -179,3 +179,140 @@ def test_search_handles_empty_keyword(db_session):
     # 빈 검색어(또는 공백만)는 예외 없이 "필터 없음"과 같은 전체 목록을 반환해야 한다.
     assert [r.id for r in service.search(keyword="")] == [r.id for r in service.search()]
     assert [r.id for r in service.search(keyword="   ")] == [r.id for r in service.search()]
+
+
+def test_check_integrity_reports_healthy_index(db_session):
+    from src.search.fts import SearchIndexService
+
+    service = InventionService(db_session)
+    service.quick_create(QuickIdeaInput(memo="정상 색인 테스트"))
+
+    report = SearchIndexService(db_session).check_integrity()
+    assert report.is_healthy
+    assert report.total_inventions == 1
+    assert report.indexed_count == 1
+
+
+def test_check_integrity_detects_missing_index(db_session):
+    from sqlalchemy import text
+
+    from src.search.fts import FTS_TABLE, SearchIndexService
+
+    service = InventionService(db_session)
+    inv = service.quick_create(QuickIdeaInput(memo="색인 누락 테스트"))
+    db_session.execute(
+        text(f"DELETE FROM {FTS_TABLE} WHERE invention_id = :id"), {"id": inv.id}
+    )
+
+    report = SearchIndexService(db_session).check_integrity()
+    assert not report.is_healthy
+    assert inv.id in report.missing_ids
+
+
+def test_check_integrity_detects_orphaned_index(db_session):
+    from sqlalchemy import text
+
+    from src.search.fts import FTS_TABLE, SearchIndexService
+
+    service = InventionService(db_session)
+    inv = service.quick_create(QuickIdeaInput(memo="고아 색인 테스트"))
+    service.purge(inv.id)  # 실제로 행을 지워야 진짜 "고아" 색인 상태가 된다
+    # purge()가 정상적으로 색인도 지우므로, 고아 상태를 인위적으로 재현한다.
+    db_session.execute(
+        text(
+            f"INSERT INTO {FTS_TABLE} (invention_id, invention_no, title, original_idea, "
+            "content_text, tags, attachment_names, experiment_text, ai_results_text) "
+            "VALUES (:id, 'INV-2026-99999', '삭제된 발명', '본문', '', '', '', '', '')"
+        ),
+        {"id": inv.id},
+    )
+
+    report = SearchIndexService(db_session).check_integrity()
+    assert not report.is_healthy
+    assert inv.id in report.orphaned_ids
+
+
+def test_check_integrity_detects_stale_title(db_session):
+    from sqlalchemy import text
+
+    from src.search.fts import FTS_TABLE, SearchIndexService
+
+    service = InventionService(db_session)
+    inv = service.quick_create(QuickIdeaInput(memo="오래된 색인 테스트", title="고정 제목"))
+    db_session.execute(
+        text(f"UPDATE {FTS_TABLE} SET title = '옛날 제목' WHERE invention_id = :id"),
+        {"id": inv.id},
+    )
+
+    report = SearchIndexService(db_session).check_integrity()
+    assert not report.is_healthy
+    assert inv.id in report.stale_ids
+
+
+def test_rebuild_all_fixes_reported_problems(db_session):
+    from sqlalchemy import text
+
+    from src.search.fts import FTS_TABLE, SearchIndexService
+
+    service = InventionService(db_session)
+    inv = service.quick_create(QuickIdeaInput(memo="복구 테스트"))
+    db_session.execute(
+        text(f"DELETE FROM {FTS_TABLE} WHERE invention_id = :id"), {"id": inv.id}
+    )
+
+    index_service = SearchIndexService(db_session)
+    assert not index_service.check_integrity().is_healthy
+
+    index_service.rebuild_all()
+
+    assert index_service.check_integrity().is_healthy
+
+
+def test_reindex_failure_does_not_roll_back_core_content_save(db_session, monkeypatch):
+    """검색 색인은 발명/실험/AI결과로부터 다시 만들 수 있는 파생 데이터다 —
+    색인 갱신(FTS 테이블 쓰기)이 실패해도, 같은 트랜잭션에서 방금 저장한
+    핵심 발명 내용은 롤백되지 않고 그대로 남아 있어야 한다."""
+    from src.search.fts import SearchIndexService
+
+    service = InventionService(db_session)
+    inv = service.quick_create(QuickIdeaInput(memo="색인 실패해도 살아남아야 하는 내용"))
+
+    def broken_delete_index_rows(self, invention_id):
+        raise OperationalError("stmt", {}, Exception("색인 테이블 손상(시뮬레이션)"))
+
+    from sqlalchemy.exc import OperationalError
+
+    monkeypatch.setattr(
+        SearchIndexService, "_delete_index_rows", broken_delete_index_rows
+    )
+
+    ok = InventionService(db_session).search_index.reindex_invention(inv.id)
+    assert ok is False  # 실패했음을 알린다
+
+    # 색인 갱신은 실패했지만, 핵심 데이터(발명 자체)는 여전히 조회 가능해야 한다.
+    still_there = InventionService(db_session).get(inv.id)
+    assert still_there is not None
+    assert still_there.original_idea == "색인 실패해도 살아남아야 하는 내용"
+
+
+def test_reindex_failure_allows_subsequent_saves_in_same_session(db_session, monkeypatch):
+    """색인 갱신 실패 이후에도 같은 세션을 계속 정상적으로 쓸 수 있어야
+    한다 — SAVEPOINT 롤백만 일어나고 세션 전체가 못 쓰게 되면 안 된다."""
+    from sqlalchemy.exc import OperationalError
+
+    from src.search.fts import SearchIndexService
+
+    def broken_delete_index_rows(self, invention_id):
+        raise OperationalError("stmt", {}, Exception("색인 테이블 손상(시뮬레이션)"))
+
+    monkeypatch.setattr(
+        SearchIndexService, "_delete_index_rows", broken_delete_index_rows
+    )
+
+    service = InventionService(db_session)
+    inv = service.quick_create(QuickIdeaInput(memo="색인 실패 이후"))
+
+    # 색인 갱신이 실패한 뒤에도 다른 저장 작업이 정상 동작해야 한다.
+    updated = service.update_fields(inv.id, core_principle="세션이 살아있는지 확인")
+    assert updated.core_principle == "세션이 살아있는지 확인"
+    db_session.commit()

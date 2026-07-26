@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import streamlit as st
 
-from src.database.engine import init_engine
+from src.database.engine import DataDirectoryError, init_engine
+from src.database.migrations import MigrationBackupError
 from src.ui.components.layout import apply_base_style, go, legal_notice, nav_row
 from src.ui.pages import home, invention_detail, invention_list, quick_capture, settings
 
@@ -18,7 +19,11 @@ st.set_page_config(
 )
 
 apply_base_style()
-init_engine()
+try:
+    init_engine()
+except (MigrationBackupError, DataDirectoryError) as exc:
+    st.error(str(exc))
+    st.stop()
 
 if "page" not in st.session_state:
     st.session_state.page = "home"

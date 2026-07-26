@@ -2,7 +2,25 @@ from __future__ import annotations
 
 from src.inventions.schemas import InventionInput
 from src.inventions.service import InventionService
-from src.reports.markdown_exporter import export_invention_markdown
+from src.reports.markdown_exporter import export_invention_markdown, safe_filename
+
+
+def test_safe_filename_strips_windows_forbidden_characters():
+    assert safe_filename('a<b>c:d"e/f\\g|h?i*j') == "a_b_c_d_e_f_g_h_i_j"
+
+
+def test_safe_filename_passes_through_normal_invention_no():
+    assert safe_filename("INV-2026-00001") == "INV-2026-00001"
+
+
+def test_safe_filename_falls_back_when_result_is_empty():
+    assert safe_filename("") == "untitled"
+    assert safe_filename("   ") == "untitled"
+    assert safe_filename("...") == "untitled"
+
+
+def test_safe_filename_strips_control_characters():
+    assert safe_filename("title\x00\x1fname") == "title__name"
 
 
 def test_export_invention_markdown_contains_key_sections(db_session):

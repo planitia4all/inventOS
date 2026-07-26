@@ -1,10 +1,22 @@
 """발명 데이터 접근 계층."""
 from __future__ import annotations
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from src.database.models import Invention, InventionRevision
+from src.database.models import (
+    Attachment,
+    Experiment,
+    Invention,
+    InventionAIResult,
+    InventionRevision,
+    InventionTag,
+    Tag,
+)
+from src.search.fts import CONTENT_FIELDS
+
+# 실험 기록에서 fallback 검색이 훑는 필드 (src/search/fts.py의 색인 범위와 맞춘다)
+_EXPERIMENT_SEARCH_FIELDS = ("conditions", "results", "failure_reason", "improvement_ideas")
 
 
 class InventionRepository:
@@ -20,7 +32,11 @@ class InventionRepository:
         return self.session.get(Invention, invention_id)
 
     def list_all(self, include_archived: bool = False) -> list[Invention]:
-        stmt = select(Invention).order_by(Invention.updated_at.desc())
+        stmt = (
+            select(Invention)
+            .where(Invention.deleted_at.is_(None))
+            .order_by(Invention.updated_at.desc())
+        )
         if not include_archived:
             stmt = stmt.where(Invention.is_archived.is_(False))
         return list(self.session.scalars(stmt))
@@ -28,7 +44,7 @@ class InventionRepository:
     def list_by_created(self, limit: int = 5) -> list[Invention]:
         stmt = (
             select(Invention)
-            .where(Invention.is_archived.is_(False))
+            .where(Invention.is_archived.is_(False), Invention.deleted_at.is_(None))
             .order_by(Invention.created_at.desc())
             .limit(limit)
         )
@@ -37,8 +53,20 @@ class InventionRepository:
     def list_children(self, invention_id: str) -> list[Invention]:
         stmt = (
             select(Invention)
-            .where(Invention.parent_invention_id == invention_id)
+            .where(
+                Invention.parent_invention_id == invention_id,
+                Invention.deleted_at.is_(None),
+            )
             .order_by(Invention.created_at.asc())
+        )
+        return list(self.session.scalars(stmt))
+
+    def list_trashed(self) -> list[Invention]:
+        """휴지통 목록. 최근에 지운 순서로 보여준다."""
+        stmt = (
+            select(Invention)
+            .where(Invention.deleted_at.is_not(None))
+            .order_by(Invention.deleted_at.desc())
         )
         return list(self.session.scalars(stmt))
 
@@ -49,22 +77,65 @@ class InventionRepository:
         status: str | None = None,
         include_archived: bool = False,
     ) -> list[Invention]:
-        """제목/원본만 보는 단순 검색 (FTS 색인이 없을 때의 대체 경로)."""
-        stmt = select(Invention)
+        """FTS 색인을 쓸 수 없을 때의 대체(fallback) 검색.
+
+        FTS와 똑같은 범위(발명번호/제목/원본/정리된 내용/태그/첨부파일명/
+        실험기록/AI결과)를 ILIKE로 훑는다 — 정상 검색과 fallback 검색의
+        결과 범위가 달라 보이지 않도록 맞춘 것이다. FTS 장애 상황에서만
+        실행되므로 조금 느려도 괜찮다.
+        """
+        stmt = select(Invention).where(Invention.deleted_at.is_(None))
         if not include_archived:
             stmt = stmt.where(Invention.is_archived.is_(False))
-        if keyword:
-            like = f"%{keyword}%"
-            stmt = stmt.where(
-                (Invention.title.ilike(like))
-                | (Invention.original_idea.ilike(like))
-            )
+        if keyword and keyword.strip():
+            matched_ids = self._fallback_keyword_ids(keyword.strip())
+            stmt = stmt.where(Invention.id.in_(matched_ids))
         if technical_field:
             stmt = stmt.where(Invention.technical_field == technical_field)
         if status:
             stmt = stmt.where(Invention.status == status)
         stmt = stmt.order_by(Invention.updated_at.desc())
         return list(self.session.scalars(stmt))
+
+    def _fallback_keyword_ids(self, keyword: str) -> set[str]:
+        like = f"%{keyword}%"
+        ids: set[str] = set()
+
+        direct_conditions = [
+            Invention.invention_no.ilike(like),
+            Invention.title.ilike(like),
+            Invention.original_idea.ilike(like),
+        ] + [getattr(Invention, name).ilike(like) for name in CONTENT_FIELDS]
+        ids.update(
+            row[0]
+            for row in self.session.execute(select(Invention.id).where(or_(*direct_conditions)))
+        )
+
+        tag_stmt = (
+            select(InventionTag.invention_id)
+            .join(Tag, Tag.id == InventionTag.tag_id)
+            .where(Tag.name.ilike(like))
+        )
+        ids.update(row[0] for row in self.session.execute(tag_stmt))
+
+        attachment_stmt = select(Attachment.invention_id).where(
+            Attachment.original_filename.ilike(like)
+        )
+        ids.update(row[0] for row in self.session.execute(attachment_stmt))
+
+        experiment_conditions = [
+            getattr(Experiment, name).ilike(like) for name in _EXPERIMENT_SEARCH_FIELDS
+        ]
+        experiment_stmt = select(Experiment.invention_id).where(or_(*experiment_conditions))
+        ids.update(row[0] for row in self.session.execute(experiment_stmt))
+
+        ai_result_stmt = select(InventionAIResult.invention_id).where(
+            InventionAIResult.content.ilike(like),
+            InventionAIResult.status != "삭제됨",
+        )
+        ids.update(row[0] for row in self.session.execute(ai_result_stmt))
+
+        return ids
 
     def search_by_ids(
         self,
@@ -76,7 +147,9 @@ class InventionRepository:
         """FTS 검색 결과(관련도 순 id 목록)를 그 순서 그대로 Invention으로 채운다."""
         if not invention_ids:
             return []
-        stmt = select(Invention).where(Invention.id.in_(invention_ids))
+        stmt = select(Invention).where(
+            Invention.id.in_(invention_ids), Invention.deleted_at.is_(None)
+        )
         if not include_archived:
             stmt = stmt.where(Invention.is_archived.is_(False))
         if technical_field:
