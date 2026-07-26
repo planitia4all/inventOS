@@ -163,40 +163,50 @@ src/database/models.py  ← Database (SQLAlchemy ORM). 테이블 정의만 담�
 
 ## 설치 및 실행
 
-### 1. Python 설치 확인
+대상 환경은 **Windows + VS Code**를 기준으로 합니다. Python 3.11 이상이
+필요합니다(`python --version`으로 확인).
 
-Python 3.11 이상이 필요합니다.
+### 빠른 시작 (Windows PowerShell)
 
-```bash
-python --version
-```
-
-### 2. 가상환경 생성 및 패키지 설치
-
-**Windows (PowerShell)**
+VS Code에서 이 폴더를 열고 통합 터미널(PowerShell)에서 순서대로
+실행하세요:
 
 ```powershell
 python -m venv .venv
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 pip install -r requirements.txt
+Copy-Item .env.example .env
+python -m streamlit run app.py
 ```
 
-**macOS / Linux**
+- `Set-ExecutionPolicy ...`는 PowerShell이 기본적으로 가상환경 활성화
+  스크립트(`Activate.ps1`) 실행을 막는 경우가 있어 필요합니다(현재
+  터미널 세션에만 적용되며, 시스템 전체 설정을 바꾸지 않습니다).
+- `python -m streamlit run app.py`처럼 `python -m`을 붙이면, PATH 설정과
+  무관하게 방금 활성화한 가상환경의 Python이 확실하게 실행됩니다.
+- API 키 없이도 정상 동작합니다(Mock 데이터로 대체) — `.env`는 나중에
+  채워도 됩니다.
+
+브라우저가 자동으로 열리지 않으면 `http://localhost:8501` 로 접속하세요.
+
+### 빠른 시작 (macOS / Linux)
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
 pip install -r requirements.txt
+cp .env.example .env
+python -m streamlit run app.py
 ```
 
-### 3. (선택) 환경변수 설정
+### (선택) 환경변수 설정
 
-API 키를 사용하려면 `.env.example`을 `.env`로 복사한 뒤 값을 채워 넣습니다.
-API 키가 없어도 프로그램은 정상 동작합니다 (Mock 데이터로 대체).
-
-```bash
-cp .env.example .env   # Windows: copy .env.example .env
-```
+API 키를 사용하려면 `.env.example`을 `.env`로 복사한 뒤 값을 채워 넣습니다
+(위 빠른 시작에 이미 포함되어 있습니다). API 키가 없어도 프로그램은
+정상 동작합니다 (Mock 데이터로 대체).
 
 `.env` 주요 항목:
 
@@ -211,13 +221,10 @@ cp .env.example .env   # Windows: copy .env.example .env
 설정 화면(⚙️ 설정 → AI Provider)에서 현재 실제로 어떤 Provider가 동작
 중인지, 문제가 있으면 어떤 이유인지 항상 확인할 수 있습니다.
 
-### 4. 실행
+### 실행 후 참고
 
-```bash
-streamlit run app.py
-```
-
-브라우저가 자동으로 열리지 않으면 `http://localhost:8501` 로 접속하세요.
+가상환경을 이미 활성화했다면 이후에는 `python -m streamlit run app.py`
+(또는 `streamlit run app.py`)만 다시 실행하면 됩니다.
 
 기존 DB를 열면 다음이 자동으로 일어납니다(`run_migrations`):
 
@@ -232,11 +239,75 @@ streamlit run app.py
 
 기록은 항상 보존됩니다 — 이 과정에서 기존 발명 데이터가 지워지지 않습니다.
 
-### 5. 테스트 실행
+### 테스트 실행
 
 ```bash
 pytest
 ```
+
+정확한 검증 환경/패키지 버전은 [검증 환경](#검증-환경) 절을 참고하세요.
+
+## 검증 환경
+
+아래는 이 Release Candidate가 실제로 통과한 환경/버전 기록이다 —
+"196 passed" 같은 숫자만으로는 재현 가능성을 보장할 수 없어서, 다음에
+누가(또는 어떤 CI가) 같은 코드로 다시 검증할 때 기준으로 삼을 수 있도록
+남겨 둔다.
+
+| 항목 | 값 |
+|---|---|
+| OS | Ubuntu 24.04.4 LTS (Linux, 컨테이너 환경) |
+| Python | 3.11.15 |
+| Streamlit | 1.60.0 |
+| SQLAlchemy | 2.0.51 |
+| pytest | 9.1.1 |
+| Playwright | 1.61.0 |
+| anthropic (SDK) | 0.120.0 |
+| httpx | 0.28.1 |
+| scikit-learn | 1.9.0 |
+| python-dotenv | 1.2.2 |
+
+- **정확한 버전으로 맞추려면**: `pip install -r requirements-dev.txt`
+  (`requirements.txt`는 `>=`만 명시해 유연하지만, 버전이 달라지면 결과가
+  달라질 수 있다 — 검증 당시와 동일하게 재현하려면 `requirements-dev.txt`를 쓴다).
+- **테스트 실행 명령**: `pytest tests/ -q` (프로젝트 루트에서 실행)
+- **테스트 중 사용한 환경변수**: 없음. `tests/conftest.py`의 `db_session`
+  픽스처가 매 테스트마다 `sqlite:///:memory:` 인메모리 DB를 새로
+  만들고(`Base.metadata.create_all` + `ensure_index_table`) 테스트가
+  끝나면 버린다 — `.env` 파일이나 API 키 없이도 전체 테스트 스위트가
+  통과한다(AI Provider가 필요한 테스트는 Mock을 쓴다).
+- **Playwright 브라우저 검증**: `tests/e2e/`에 실제로 커밋된 자동화
+  테스트가 있다 — 아래 "Playwright E2E 테스트" 절 참고.
+
+### Playwright E2E 테스트
+
+`tests/e2e/`는 실제 Streamlit 서버를 서브프로세스로 띄우고(격리된 임시
+데이터 폴더, `INVENTOS_AI_PROVIDER=mock`) Playwright로 브라우저를 열어
+직접 클릭/입력하는 자동화 테스트다. 기본 `pytest`(`pytest tests/` 또는
+그냥 `pytest`)에는 포함되지 않는다 — 서버/브라우저 기동이 필요해
+무겁고 느리기 때문에, `pytest.ini`의 `norecursedirs`로 기본 수집에서
+제외해 두었다. 따로 실행해야 한다:
+
+```bash
+playwright install chromium   # 최초 1회만 (브라우저 바이너리 다운로드)
+pytest tests/e2e -q
+```
+
+자동화된 시나리오(`tests/e2e/test_core_flow.py`, `test_mobile_flow.py`):
+
+- 빠른 아이디어 기록 저장 → 홈 화면에 나타남
+- 통합 검색으로 방금 저장한 고유 문구 찾기
+- AI로 검토하기(Mock) → 전체 반영 → 반영 결과 확인
+- AI로 검토하기(Mock) → "일부만 반영" 패널이 오류 없이 열림
+- 실험 기록 추가
+- 파생 아이디어 생성 → 부모-자식 관계 화면 확인
+- 홈/빠른기록/상세 화면의 모바일(390px) 가로 스크롤 없음 확인
+
+이 흐름들 외에(예: 특허 수동 등록, 설정 화면의 백업/휴지통/무결성
+검사 버튼들, 첨부파일 업로드 미리보기) 이번 RC 단계에서 손으로 눌러
+확인은 했지만 자동화 테스트로 코드에 남기지는 않았다 — 필요하면
+`tests/e2e/`에 같은 패턴(`conftest.py`의 `page`/`mobile_page` fixture)으로
+추가하면 된다.
 
 ## 폴더 구조
 
@@ -272,6 +343,7 @@ inventos/
 │     └─ components/              # layout(모바일 CSS), actions(안전한 저장+새로고침)
 ├─ data/                          # SQLite DB + 첨부파일 (git 제외)
 └─ tests/
+   └─ e2e/                        # Playwright 브라우저 자동화 테스트 (기본 pytest 실행에서 제외)
 ```
 
 ## 데이터 저장 위치

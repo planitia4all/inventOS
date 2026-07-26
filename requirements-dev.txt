@@ -1,0 +1,18 @@
+# 개발/테스트 환경에서 실제로 검증된 정확한 버전 고정.
+#
+# requirements.txt는 최소 버전(>=)만 명시해 유연하지만, 그만큼 나중에
+# 패키지가 업데이트되면 똑같은 코드에서도 테스트 결과가 달라질 수 있다.
+# 이 파일은 "이 버전 조합에서 pytest 전체 통과 + Playwright 시나리오
+# 검증을 마쳤다"는 사실을 재현 가능하게 기록해 둔다.
+#
+# 설치: pip install -r requirements-dev.txt
+# (requirements.txt 대신 이 파일을 쓰면 검증 당시와 동일한 버전으로 맞춰진다)
+
+streamlit==1.60.0
+SQLAlchemy==2.0.51
+httpx==0.28.1
+python-dotenv==1.2.2
+scikit-learn==1.9.0
+anthropic==0.120.0
+pytest==9.1.1
+playwright==1.61.0
