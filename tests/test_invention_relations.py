@@ -1,9 +1,13 @@
-"""파생 아이디어(부모-자식) 관계 검증. UI에는 아직 노출하지 않지만
-DB/서비스 계층은 미리 준비해 둔다."""
+"""파생 아이디어(부모-자식) 관계 검증."""
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import func, select
 
+from src.config.settings import Settings
+from src.database.models import Invention
+from src.experiments.schemas import ExperimentInput
+from src.experiments.service import ExperimentService, draft_text_from_experiment
 from src.inventions.schemas import QuickIdeaInput
 from src.inventions.service import InventionService
 
@@ -48,3 +52,165 @@ def test_no_children_returns_empty_list(db_session):
     service = InventionService(db_session)
     parent = service.quick_create(QuickIdeaInput(memo="파생 없음"))
     assert service.list_children(parent.id) == []
+
+
+def test_create_child_stores_derivation_reason(db_session):
+    service = InventionService(db_session)
+    parent = service.quick_create(QuickIdeaInput(memo="Separator 접합"))
+    child = service.create_child(
+        parent.id,
+        QuickIdeaInput(memo="Ceramic 접합 방식"),
+        derivation_reason="재료 변경",
+    )
+    assert child.derivation_reason == "재료 변경"
+
+
+def test_create_child_copies_selected_fields_only(db_session):
+    service = InventionService(db_session)
+    parent = service.quick_create(QuickIdeaInput(memo="Separator 접합"))
+    InventionService(db_session).update_fields(
+        parent.id,
+        problem_to_solve="접합 강도 부족",
+        core_principle="레이저로 국소 가열",
+        operating_principle="펄스 레이저를 순차 조사한다",
+    )
+
+    child = service.create_child(
+        parent.id,
+        QuickIdeaInput(memo="Laser Hybrid 방식"),
+        copy_fields=["problem_to_solve", "core_principle"],
+    )
+
+    assert child.problem_to_solve == "접합 강도 부족"
+    assert child.core_principle == "레이저로 국소 가열"
+    assert not (child.operating_principle or "").strip()
+
+
+def test_create_child_default_copies_nothing(db_session):
+    service = InventionService(db_session)
+    parent = service.quick_create(QuickIdeaInput(memo="Separator 접합"))
+    InventionService(db_session).update_fields(parent.id, problem_to_solve="접합 강도 부족")
+
+    child = service.create_child(parent.id, QuickIdeaInput(memo="관계만 연결"))
+
+    assert child.parent_invention_id == parent.id
+    assert not (child.problem_to_solve or "").strip()
+
+
+def test_create_child_rejects_unknown_copy_field(db_session):
+    service = InventionService(db_session)
+    parent = service.quick_create(QuickIdeaInput(memo="Separator 접합"))
+    with pytest.raises(ValueError):
+        service.create_child(
+            parent.id,
+            QuickIdeaInput(memo="잘못된 파생"),
+            copy_fields=["no_such_field"],
+        )
+
+
+def test_create_child_copies_tags_when_requested(db_session):
+    service = InventionService(db_session)
+    parent = service.quick_create(QuickIdeaInput(memo="Separator 접합", keywords=["배터리", "AI"]))
+
+    child = service.create_child(
+        parent.id, QuickIdeaInput(memo="파생"), copy_tags=True
+    )
+
+    assert set(service.tags.tag_names(child.id)) == {"배터리", "AI"}
+
+
+def test_create_child_does_not_copy_tags_by_default(db_session):
+    service = InventionService(db_session)
+    parent = service.quick_create(QuickIdeaInput(memo="Separator 접합", keywords=["배터리"]))
+
+    child = service.create_child(parent.id, QuickIdeaInput(memo="파생"))
+
+    assert service.tags.tag_names(child.id) == []
+
+
+def test_create_child_copies_attachments_when_requested(db_session, tmp_path):
+    from src.attachments.service import AttachmentService
+
+    settings = Settings(data_dir=tmp_path)
+    service = InventionService(db_session, settings=settings)
+    parent = service.quick_create(QuickIdeaInput(memo="Separator 접합"))
+    AttachmentService(db_session, settings=settings).save(
+        parent.id, "photo.png", b"fake-bytes"
+    )
+
+    child = service.create_child(
+        parent.id, QuickIdeaInput(memo="파생"), copy_attachments=True
+    )
+
+    copied = AttachmentService(db_session, settings=settings).list_for_invention(child.id)
+    assert len(copied) == 1
+    assert copied[0].original_filename == "photo.png"
+    assert copied[0].invention_id == child.id
+
+
+def test_create_child_from_experiment_links_source(db_session):
+    service = InventionService(db_session)
+    parent = service.quick_create(QuickIdeaInput(memo="Separator 접합"))
+    experiment = ExperimentService(db_session).create(
+        parent.id, ExperimentInput(results="접합 강도 20% 향상")
+    )
+
+    child = service.create_child(
+        parent.id,
+        QuickIdeaInput(memo=draft_text_from_experiment(experiment)),
+        derivation_reason="실험 결과에서 파생",
+        source_experiment_id=experiment.id,
+    )
+
+    assert child.source_experiment_id == experiment.id
+    assert "접합 강도 20% 향상" in child.original_idea
+
+
+def test_draft_text_from_experiment_does_not_touch_experiment(db_session):
+    invention = InventionService(db_session).quick_create(QuickIdeaInput(memo="원본"))
+    experiment = ExperimentService(db_session).create(
+        invention.id, ExperimentInput(conditions="200도", results="성공")
+    )
+
+    text = draft_text_from_experiment(experiment)
+
+    assert "200도" in text
+    assert "성공" in text
+    assert experiment.conditions == "200도"
+
+
+def test_create_child_logs_derivation_reason_in_timeline_meta(db_session):
+    service = InventionService(db_session)
+    parent = service.quick_create(QuickIdeaInput(memo="Separator 접합"))
+    child = service.create_child(
+        parent.id,
+        QuickIdeaInput(memo="파생"),
+        derivation_reason="성능 개선",
+    )
+
+    parent_events = service.list_timeline(parent.id)
+    child_events = service.list_timeline(child.id)
+    derived_created = next(e for e in parent_events if e.event_type == "derived_child_created")
+    derived_from = next(e for e in child_events if e.event_type == "derived_from_parent")
+
+    assert derived_created.meta_json["derivation_reason"] == "성능 개선"
+    assert derived_from.meta_json["derivation_reason"] == "성능 개선"
+    assert "성능 개선" in derived_created.description
+    assert "성능 개선" in derived_from.description
+
+
+def test_create_child_transaction_rolls_back_on_invalid_copy_field(db_session):
+    service = InventionService(db_session)
+    parent = service.quick_create(QuickIdeaInput(memo="Separator 접합"))
+    before = db_session.scalar(select(func.count()).select_from(Invention))
+
+    with pytest.raises(ValueError):
+        with db_session.begin_nested():
+            service.create_child(
+                parent.id,
+                QuickIdeaInput(memo="잘못된 파생"),
+                copy_fields=["no_such_field"],
+            )
+
+    after = db_session.scalar(select(func.count()).select_from(Invention))
+    assert after == before

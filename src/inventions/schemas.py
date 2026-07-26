@@ -28,6 +28,29 @@ LEGACY_STATUS_MIGRATION: dict[str, str] = {
     "완료": "개발 중",
 }
 
+# 파생 아이디어를 만들 때 선택하는 이유. 자유 문자열이라 목록 밖의 값(기타
+# 입력)도 그대로 저장된다.
+DERIVATION_REASONS = [
+    "구조 개선",
+    "재료 변경",
+    "작동 방식 변경",
+    "문제 해결",
+    "비용 절감",
+    "성능 개선",
+    "제조 방법 변경",
+    "다른 산업 적용",
+    "실험 결과에서 파생",
+    "기타",
+]
+
+# 파생 아이디어를 만들 때 부모에서 새 아이디어로 그대로 옮길 수 있는 필드.
+# (항목 이름, 발명 필드명)
+DERIVATION_COPY_FIELDS: list[tuple[str, str]] = [
+    ("해결하려는 문제", "problem_to_solve"),
+    ("핵심 아이디어", "core_principle"),
+    ("작동 원리", "operating_principle"),
+]
+
 # 상세 화면 항목의 라벨과 도움말. 전문 용어 대신 쉬운 표현을 쓰고,
 # 특허 용어가 필요한 경우에만 도움말로 덧붙인다.
 FIELD_LABELS: dict[str, tuple[str, str]] = {

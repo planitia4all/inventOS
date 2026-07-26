@@ -90,3 +90,20 @@ def test_save_logs_timeline_event(db_session, tmp_path):
 
     types = [e.event_type for e in InventionService(db_session).list_timeline(invention.id)]
     assert "attachment_added" in types
+
+
+def test_copy_to_invention_creates_independent_file(db_session, tmp_path):
+    parent = make_invention(db_session)
+    child = InventionService(db_session).quick_create(QuickIdeaInput(memo="파생 아이디어"))
+    service = make_service(db_session, tmp_path)
+    original = service.save(parent.id, "photo.png", b"original-bytes", category="사진")
+
+    copied = service.copy_to_invention(original, child.id)
+
+    assert copied.invention_id == child.id
+    assert copied.original_filename == "photo.png"
+    assert copied.category == "사진"
+    assert copied.id != original.id
+    assert service.resolve_path(copied).read_bytes() == b"original-bytes"
+    # 원본 파일은 그대로 남아 있다 (복사이지 이동이 아니다).
+    assert service.resolve_path(original).exists()

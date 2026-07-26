@@ -11,6 +11,7 @@ import streamlit as st
 from src.database.engine import get_session
 from src.inventions.service import InventionService
 from src.ui.components.layout import go, idea_card
+from src.ui.pages.quick_capture import clear_derive_context
 
 _RECENT_LIMIT = 5
 
@@ -44,6 +45,7 @@ def render() -> None:
     st.caption("떠오른 생각을 먼저 적어두고, 정리는 나중에 하세요.")
 
     if st.button("➕ 새 아이디어 기록", type="primary", key="home_new"):
+        clear_derive_context()
         go("capture")
 
     keyword = st.text_input(

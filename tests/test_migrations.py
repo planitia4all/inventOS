@@ -45,6 +45,8 @@ _NEW_COLUMNS = {
     "is_favorite",
     "parent_invention_id",
     "owner_id",
+    "derivation_reason",
+    "source_experiment_id",
 }
 
 
