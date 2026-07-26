@@ -266,3 +266,53 @@ def test_rebuild_all_fixes_reported_problems(db_session):
     index_service.rebuild_all()
 
     assert index_service.check_integrity().is_healthy
+
+
+def test_reindex_failure_does_not_roll_back_core_content_save(db_session, monkeypatch):
+    """검색 색인은 발명/실험/AI결과로부터 다시 만들 수 있는 파생 데이터다 —
+    색인 갱신(FTS 테이블 쓰기)이 실패해도, 같은 트랜잭션에서 방금 저장한
+    핵심 발명 내용은 롤백되지 않고 그대로 남아 있어야 한다."""
+    from src.search.fts import SearchIndexService
+
+    service = InventionService(db_session)
+    inv = service.quick_create(QuickIdeaInput(memo="색인 실패해도 살아남아야 하는 내용"))
+
+    def broken_delete_index_rows(self, invention_id):
+        raise OperationalError("stmt", {}, Exception("색인 테이블 손상(시뮬레이션)"))
+
+    from sqlalchemy.exc import OperationalError
+
+    monkeypatch.setattr(
+        SearchIndexService, "_delete_index_rows", broken_delete_index_rows
+    )
+
+    ok = InventionService(db_session).search_index.reindex_invention(inv.id)
+    assert ok is False  # 실패했음을 알린다
+
+    # 색인 갱신은 실패했지만, 핵심 데이터(발명 자체)는 여전히 조회 가능해야 한다.
+    still_there = InventionService(db_session).get(inv.id)
+    assert still_there is not None
+    assert still_there.original_idea == "색인 실패해도 살아남아야 하는 내용"
+
+
+def test_reindex_failure_allows_subsequent_saves_in_same_session(db_session, monkeypatch):
+    """색인 갱신 실패 이후에도 같은 세션을 계속 정상적으로 쓸 수 있어야
+    한다 — SAVEPOINT 롤백만 일어나고 세션 전체가 못 쓰게 되면 안 된다."""
+    from sqlalchemy.exc import OperationalError
+
+    from src.search.fts import SearchIndexService
+
+    def broken_delete_index_rows(self, invention_id):
+        raise OperationalError("stmt", {}, Exception("색인 테이블 손상(시뮬레이션)"))
+
+    monkeypatch.setattr(
+        SearchIndexService, "_delete_index_rows", broken_delete_index_rows
+    )
+
+    service = InventionService(db_session)
+    inv = service.quick_create(QuickIdeaInput(memo="색인 실패 이후"))
+
+    # 색인 갱신이 실패한 뒤에도 다른 저장 작업이 정상 동작해야 한다.
+    updated = service.update_fields(inv.id, core_principle="세션이 살아있는지 확인")
+    assert updated.core_principle == "세션이 살아있는지 확인"
+    db_session.commit()

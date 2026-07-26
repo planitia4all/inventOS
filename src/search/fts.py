@@ -15,7 +15,7 @@ import logging
 from dataclasses import dataclass, field
 
 from sqlalchemy import Engine, text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
@@ -124,7 +124,7 @@ class SearchIndexService:
     def __init__(self, session: Session):
         self.session = session
 
-    def reindex_invention(self, invention_id: str) -> None:
+    def reindex_invention(self, invention_id: str) -> bool:
         """이 발명의 색인을 최신 내용으로 다시 만든다.
 
         관계(`invention.attachments` 등)를 그대로 쓰지 않고 매번 직접
@@ -133,6 +133,13 @@ class SearchIndexService:
         첨부파일)가 추가돼도 이미 로딩된 컬렉션이 자동으로 갱신되지
         않기 때문이다 (SQLAlchemy의 일반적인 동작). 직접 쿼리하면 항상
         flush된 최신 상태를 본다.
+
+        검색 색인은 발명/실험/첨부파일/AI 결과로부터 다시 만들 수 있는
+        파생 데이터다 — 실제 쓰기(DELETE+INSERT)는 SAVEPOINT로 감싸서,
+        색인 테이블이 손상되는 등 이 부분만 실패해도 호출한 쪽이 이미
+        진행 중인 핵심 데이터 저장(발명 내용 수정 등)까지 함께 롤백되지
+        않는다. 실패하면 로그만 남기고 `False`를 반환한다 — 설정 화면의
+        "검색 색인 검사 및 다시 만들기"로 나중에 복구할 수 있다.
         """
         from src.database.models import (
             Attachment,
@@ -145,8 +152,7 @@ class SearchIndexService:
 
         invention = self.session.get(Invention, invention_id)
         if invention is None:
-            self.remove(invention_id)
-            return
+            return self.remove(invention_id)
 
         content_text = " ".join(
             filter(None, (getattr(invention, f) for f in CONTENT_FIELDS))
@@ -184,31 +190,56 @@ class SearchIndexService:
             if content
         )
 
-        self.remove(invention_id)
-        self.session.execute(
-            text(
-                f"""
-                INSERT INTO {FTS_TABLE}
-                    (invention_id, invention_no, title, original_idea, content_text,
-                     tags, attachment_names, experiment_text, ai_results_text)
-                VALUES (:invention_id, :invention_no, :title, :original_idea, :content_text,
-                        :tags, :attachment_names, :experiment_text, :ai_results_text)
-                """
-            ),
-            {
-                "invention_id": invention.id,
-                "invention_no": invention.invention_no,
-                "title": invention.title,
-                "original_idea": invention.original_idea,
-                "content_text": content_text,
-                "tags": tag_names,
-                "attachment_names": attachment_names,
-                "experiment_text": experiment_text,
-                "ai_results_text": ai_results_text,
-            },
-        )
+        try:
+            with self.session.begin_nested():
+                self._delete_index_rows(invention_id)
+                self.session.execute(
+                    text(
+                        f"""
+                        INSERT INTO {FTS_TABLE}
+                            (invention_id, invention_no, title, original_idea, content_text,
+                             tags, attachment_names, experiment_text, ai_results_text)
+                        VALUES (:invention_id, :invention_no, :title, :original_idea, :content_text,
+                                :tags, :attachment_names, :experiment_text, :ai_results_text)
+                        """
+                    ),
+                    {
+                        "invention_id": invention.id,
+                        "invention_no": invention.invention_no,
+                        "title": invention.title,
+                        "original_idea": invention.original_idea,
+                        "content_text": content_text,
+                        "tags": tag_names,
+                        "attachment_names": attachment_names,
+                        "experiment_text": experiment_text,
+                        "ai_results_text": ai_results_text,
+                    },
+                )
+        except SQLAlchemyError as exc:
+            logger.warning(
+                "검색 색인 갱신에 실패했습니다(핵심 저장에는 영향 없음, invention_id=%s): %s",
+                invention_id,
+                exc,
+            )
+            return False
+        return True
 
-    def remove(self, invention_id: str) -> None:
+    def remove(self, invention_id: str) -> bool:
+        """SAVEPOINT로 감싸서, 색인 삭제 실패가 호출한 쪽의 핵심 트랜잭션을
+        함께 롤백시키지 않도록 한다 (reindex_invention과 같은 이유)."""
+        try:
+            with self.session.begin_nested():
+                self._delete_index_rows(invention_id)
+        except SQLAlchemyError as exc:
+            logger.warning(
+                "검색 색인 삭제에 실패했습니다(핵심 저장에는 영향 없음, invention_id=%s): %s",
+                invention_id,
+                exc,
+            )
+            return False
+        return True
+
+    def _delete_index_rows(self, invention_id: str) -> None:
         self.session.execute(
             text(f"DELETE FROM {FTS_TABLE} WHERE invention_id = :invention_id"),
             {"invention_id": invention_id},

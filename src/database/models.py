@@ -14,12 +14,26 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import JSON, Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, event
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 class Base(DeclarativeBase):
     pass
+
+
+@event.listens_for(Engine, "connect")
+def _enable_sqlite_foreign_keys(dbapi_connection, connection_record) -> None:
+    """SQLite는 연결마다 기본적으로 FK 제약을 검사하지 않는다 — 켜 준다.
+
+    이게 없으면 예를 들어 존재하지 않는 invention_id로 첨부파일을 넣어도
+    조용히 성공한다. 켜 두면 ORM이 놓친 잘못된 참조를 DB가 마지막으로
+    막아 준다. (이 프로젝트는 SQLite만 쓰므로 항상 켠다.)
+    """
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
 
 
 def _uuid() -> str:
@@ -62,15 +76,18 @@ class Invention(Base):
     is_archived: Mapped[bool] = mapped_column(default=False)
 
     # 파생 아이디어(부모→자식) 관계. 예: Separator 접합 → Graphene Fiber 방식.
+    # ondelete="SET NULL": 부모가 지워지면 자식은 그대로 남고 관계만 끊는다
+    # (children 관계의 ORM 레벨 nullify와 같은 정책을 DB 제약에도 명시한다).
     parent_invention_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("inventions.id"), nullable=True
+        String(36), ForeignKey("inventions.id", ondelete="SET NULL"), nullable=True
     )
     # 파생 이유. 자유 문자열(추천값은 DERIVATION_REASONS, 강제는 아님) — 단순
     # Parent/Child 구조는 유지하되 "왜 파생됐는지"만 이 필드에 덧붙인다.
     derivation_reason: Mapped[str | None] = mapped_column(String(200))
-    # 실험 기록에서 파생된 아이디어면 그 실험을 가리킨다 (선택).
+    # 실험 기록에서 파생된 아이디어면 그 실험을 가리킨다 (선택). 그 실험이
+    # 지워져도 이 발명은 지워지지 않는다 — 출처 표시만 사라진다.
     source_experiment_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("experiments.id"), nullable=True
+        String(36), ForeignKey("experiments.id", ondelete="SET NULL"), nullable=True
     )
 
     # 다중 사용자 확장을 대비한 자리. 지금은 단일 사용자라 항상 None이고
@@ -388,9 +405,10 @@ class Attachment(Base):
     invention_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("inventions.id"), nullable=False
     )
-    # 특정 실험에 딸린 사진/영상이면 채워진다 (선택).
+    # 특정 실험에 딸린 사진/영상이면 채워진다 (선택). 그 실험이 지워져도
+    # 첨부파일 자체(발명에 속한 기록)는 지워지지 않는다 — 연결만 끊는다.
     experiment_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("experiments.id"), nullable=True
+        String(36), ForeignKey("experiments.id", ondelete="SET NULL"), nullable=True
     )
     original_filename: Mapped[str] = mapped_column(String(500), nullable=False)
     stored_path: Mapped[str] = mapped_column(String(1000), nullable=False)
