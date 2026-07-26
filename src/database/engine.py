@@ -15,12 +15,22 @@ _engine = None
 _SessionLocal: sessionmaker | None = None
 
 
+class DataDirectoryError(RuntimeError):
+    """데이터 저장 경로를 만들거나 쓸 수 없을 때(권한 없음, 잘못된 경로 등)."""
+
+
 def init_engine(settings: Settings | None = None):
     """엔진을 초기화하고 테이블이 없으면 생성한다."""
     global _engine, _SessionLocal
     settings = settings or get_settings()
-    settings.data_dir.mkdir(parents=True, exist_ok=True)
-    settings.attachments_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        settings.data_dir.mkdir(parents=True, exist_ok=True)
+        settings.attachments_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise DataDirectoryError(
+            f"데이터 저장 경로를 사용할 수 없습니다: {settings.data_dir} "
+            f"(원인: {exc}). INVENTOS_DATA_DIR 설정이나 폴더 쓰기 권한을 확인하세요."
+        ) from exc
 
     _engine = create_engine(
         f"sqlite:///{settings.db_path}",

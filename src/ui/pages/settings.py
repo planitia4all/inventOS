@@ -17,7 +17,7 @@ from src.database.backup import create_consistent_snapshot
 from src.database.engine import get_session
 from src.drafts.store import DraftStore
 from src.inventions.service import InventionService
-from src.reports.markdown_exporter import export_invention_markdown
+from src.reports.markdown_exporter import export_invention_markdown, safe_filename
 from src.search.fts import SearchIndexService
 
 
@@ -306,5 +306,5 @@ def _build_markdown_zip(session) -> bytes:
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for invention in inventions:
             markdown = export_invention_markdown(invention, list(invention.patent_links))
-            zf.writestr(f"{invention.invention_no}.md", markdown)
+            zf.writestr(f"{safe_filename(invention.invention_no)}.md", markdown)
     return buffer.getvalue()

@@ -44,7 +44,7 @@ from src.experiments.service import ExperimentService, draft_text_from_experimen
 from src.timeline.service import TimelineService
 from src.inventions.schemas import DETAIL_GROUPS, FIELD_LABELS, STATUS_VALUES
 from src.inventions.service import InventionService
-from src.reports.markdown_exporter import export_invention_markdown
+from src.reports.markdown_exporter import export_invention_markdown, safe_filename
 from src.ui.components.actions import run_and_rerun
 from src.ui.components.layout import go
 from src.ui.pages.quick_capture import clear_derive_context, start_derive_capture
@@ -574,7 +574,7 @@ def _render_export(invention) -> None:
         downloaded = st.download_button(
             "Markdown 파일로 저장",
             data=markdown.encode("utf-8"),
-            file_name=f"{invention.invention_no}.md",
+            file_name=f"{safe_filename(invention.invention_no)}.md",
             mime="text/markdown",
             key=f"md_{invention.id}",
         )
