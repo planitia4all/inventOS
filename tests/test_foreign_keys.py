@@ -46,14 +46,18 @@ def test_raw_insert_with_nonexistent_invention_id_is_rejected(db_session):
 
 
 def test_deleting_parent_nulls_child_fk_at_db_level(db_session):
-    """ORM이 아니라 실제 커밋된 DB 행을 직접 조회해 부모 삭제 후
-    자식의 parent_invention_id가 정말 NULL인지 확인한다."""
+    """ORM이 아니라 실제 커밋된 DB 행을 직접 조회해 부모를 영구 삭제(purge)한
+    뒤 자식의 parent_invention_id가 정말 NULL인지 확인한다.
+
+    (참고: InventionService.delete()는 소프트 삭제(휴지통 이동)로, 자식
+    관계를 건드리지 않는다 — 실제 하드 삭제는 purge()다.)
+    """
     service = InventionService(db_session)
     parent = service.quick_create(QuickIdeaInput(memo="부모 아이디어"))
     child = service.create_child(parent.id, QuickIdeaInput(memo="자식 아이디어"))
     db_session.commit()
 
-    service.delete(parent.id)
+    service.purge(parent.id)
     db_session.commit()
 
     row = db_session.execute(
@@ -133,7 +137,7 @@ def test_orm_nullify_works_even_on_pre_existing_db_without_ondelete_clause(tmp_p
         child = InventionService(session).create_child(parent.id, QuickIdeaInput(memo="예전 자식"))
         session.commit()
 
-        InventionService(session).delete(parent.id)
+        InventionService(session).purge(parent.id)
         session.commit()
         row = session.execute(
             text("SELECT parent_invention_id FROM inventions WHERE id = :id"), {"id": child.id}

@@ -54,13 +54,27 @@ def test_no_children_returns_empty_list(db_session):
     assert service.list_children(parent.id) == []
 
 
-def test_deleting_parent_preserves_children(db_session):
-    """부모를 지워도 파생된 자식 아이디어 자체는 사라지면 안 된다."""
+def test_trashing_parent_does_not_touch_children(db_session):
+    """부모를 휴지통으로 옮겨도(소프트 삭제) 자식과의 연결은 그대로다 —
+    실제로 데이터가 지워지는 게 아니라 목록/검색에서만 숨겨지기 때문이다."""
     service = InventionService(db_session)
     parent = service.quick_create(QuickIdeaInput(memo="부모 아이디어"))
     child = service.create_child(parent.id, QuickIdeaInput(memo="자식 아이디어"))
 
     service.delete(parent.id)
+
+    refreshed = service.get(child.id)
+    assert refreshed is not None
+    assert refreshed.parent_invention_id == parent.id
+
+
+def test_purging_parent_preserves_children(db_session):
+    """부모를 영구 삭제해도 파생된 자식 아이디어 자체는 사라지면 안 된다."""
+    service = InventionService(db_session)
+    parent = service.quick_create(QuickIdeaInput(memo="부모 아이디어"))
+    child = service.create_child(parent.id, QuickIdeaInput(memo="자식 아이디어"))
+
+    service.purge(parent.id)
 
     refreshed = service.get(child.id)
     assert refreshed is not None

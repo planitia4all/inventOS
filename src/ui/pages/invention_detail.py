@@ -584,7 +584,7 @@ def _render_export(invention) -> None:
 
 
 def _render_danger_zone(invention) -> None:
-    with st.expander("보관 / 삭제", expanded=False):
+    with st.expander("보관 / 휴지통", expanded=False):
         st.caption(
             "더 이상 진행하지 않는 아이디어는 지우지 말고 '보관하기'를 "
             "권장합니다 — 목록에서만 숨겨지고 기록은 그대로 남아 언제든 "
@@ -602,18 +602,18 @@ def _render_danger_zone(invention) -> None:
 
         st.markdown("---")
         confirm_key = f"confirm_del_{invention.id}"
-        if st.button("🗑️ 완전히 삭제", key=f"del_{invention.id}"):
+        if st.button("🗑️ 휴지통으로 이동", key=f"del_{invention.id}"):
             st.session_state[confirm_key] = True
 
         if st.session_state.get(confirm_key):
             st.warning(
-                f"'{invention.title}'과(와) 여기 딸린 실험 기록·AI 검토 결과·"
-                "첨부파일·연결된 선행특허·Timeline이 모두 영구적으로 삭제됩니다. "
-                "되돌릴 수 없습니다. (파생된 자식 아이디어는 삭제되지 않고 "
-                "부모 연결만 끊깁니다.) 정말 삭제하려면 확정을 눌러주세요."
+                f"'{invention.title}'을(를) 휴지통으로 옮깁니다. 목록/검색에서는 "
+                "숨겨지지만 데이터는 그대로 남아 언제든 설정 화면(⚙️ 설정 → "
+                "휴지통)에서 복원할 수 있습니다. 영구 삭제도 휴지통에서 별도로 "
+                "확인한 뒤에만 가능합니다."
             )
             cols = st.columns(2)
-            if cols[0].button("삭제 확정", key=f"del_ok_{invention.id}"):
+            if cols[0].button("휴지통으로 이동 확정", key=f"del_ok_{invention.id}"):
                 with get_session() as session:
                     InventionService(session).delete(invention.id)
                 st.session_state.pop(confirm_key, None)
@@ -637,6 +637,17 @@ def render(invention_id: str | None) -> None:
         if invention is None:
             st.error("해당 아이디어를 찾을 수 없습니다.")
             if st.button("홈으로", key="detail_missing_home"):
+                go("home")
+            return
+
+        if invention.deleted_at is not None:
+            st.warning(f"'{invention.title}'은(는) 휴지통에 있습니다. 목록/검색에 다시 나타나게 하려면 복원하세요.")
+            cols = st.columns(2)
+            if cols[0].button("복원", key=f"detail_restore_{invention.id}"):
+                run_and_rerun(
+                    lambda session, iid=invention.id: InventionService(session).restore(iid)
+                )
+            if cols[1].button("홈으로", key="detail_trashed_home"):
                 go("home")
             return
 

@@ -44,6 +44,7 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "owner_id": "VARCHAR(100)",
         "derivation_reason": "VARCHAR(200)",
         "source_experiment_id": "VARCHAR(36)",
+        "deleted_at": "DATETIME",
     },
     "attachments": {
         "experiment_id": "VARCHAR(36)",

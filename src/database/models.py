@@ -74,6 +74,12 @@ class Invention(Base):
     status: Mapped[str] = mapped_column(String(50), default="아이디어")
     is_favorite: Mapped[bool] = mapped_column(default=False)
     is_archived: Mapped[bool] = mapped_column(default=False)
+    # 휴지통(소프트 삭제). None이면 살아 있는 발명. 값이 있으면 목록/검색
+    # 기본 범위에서 숨겨지지만 실제 데이터(내용/실험/첨부파일 등)는 그대로
+    # 남아 있어 복원할 수 있다 — is_archived("보관")와는 별개 개념이다:
+    # 보관은 "계속 유지하되 목록에서 접어 둠", 휴지통은 "지우려는 의도지만
+    # 실수 방지를 위해 즉시 영구 삭제하지는 않음"이다.
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     # 파생 아이디어(부모→자식) 관계. 예: Separator 접합 → Graphene Fiber 방식.
     # ondelete="SET NULL": 부모가 지워지면 자식은 그대로 남고 관계만 끊는다

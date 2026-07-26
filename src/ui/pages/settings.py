@@ -85,6 +85,9 @@ def render() -> None:
     _render_attachment_integrity_section(settings)
 
     st.divider()
+    _render_trash_section()
+
+    st.divider()
     st.subheader("앱 정보")
     st.caption(f"InventOS v{APP_VERSION}")
     st.caption(
@@ -238,6 +241,61 @@ def _render_attachment_integrity_section(settings) -> None:
         for group in report.duplicate_groups:
             names = ", ".join(item["original_filename"] for item in group)
             st.caption(f"· {names}")
+
+
+def _render_trash_section() -> None:
+    st.subheader("휴지통")
+    st.caption(
+        "발명 상세 화면에서 '휴지통으로 이동'한 아이디어가 여기 모입니다. "
+        "목록/검색에서는 숨겨지지만 데이터는 그대로 있어 복원할 수 있습니다. "
+        "영구 삭제는 여기서만, 별도 확인을 거쳐야만 할 수 있습니다."
+    )
+
+    with get_session() as session:
+        trashed = InventionService(session).list_trashed()
+        trashed_info = [
+            {"id": inv.id, "title": inv.title, "invention_no": inv.invention_no}
+            for inv in trashed
+        ]
+
+    if not trashed_info:
+        st.caption("휴지통이 비어 있습니다.")
+        return
+
+    for item in trashed_info:
+        with st.container(border=True):
+            st.markdown(f"**{item['title']}** ({item['invention_no']})")
+            cols = st.columns(2)
+            if cols[0].button("복원", key=f"trash_restore_{item['id']}"):
+                with get_session() as session:
+                    InventionService(session).restore(item["id"])
+                st.rerun()
+
+            purge_confirm_key = f"trash_purge_confirm_{item['id']}"
+            if cols[1].button("🗑️ 영구 삭제", key=f"trash_purge_{item['id']}"):
+                st.session_state[purge_confirm_key] = True
+
+            if st.session_state.get(purge_confirm_key):
+                with get_session() as session:
+                    impact = InventionService(session).purge_impact(item["id"])
+                st.warning(
+                    "정말 영구 삭제하시겠습니까? 되돌릴 수 없습니다. 함께 사라지는 "
+                    f"데이터: 실험 기록 {impact['experiments']}건, 첨부파일 "
+                    f"{impact['attachments']}건, AI 검토 결과 {impact['ai_results']}건, "
+                    f"선행특허 비교 {impact['patent_links']}건, 버전 기록 "
+                    f"{impact['revisions']}건, Timeline {impact['timeline_events']}건. "
+                    f"(파생된 자식 아이디어 {impact['children']}건은 삭제되지 않고 "
+                    "부모 연결만 끊깁니다.)"
+                )
+                confirm_cols = st.columns(2)
+                if confirm_cols[0].button("영구 삭제 확정", key=f"trash_purge_ok_{item['id']}"):
+                    with get_session() as session:
+                        InventionService(session).purge(item["id"])
+                    st.session_state.pop(purge_confirm_key, None)
+                    st.rerun()
+                if confirm_cols[1].button("취소", key=f"trash_purge_no_{item['id']}"):
+                    st.session_state.pop(purge_confirm_key, None)
+                    st.rerun()
 
 
 def _build_markdown_zip(session) -> bytes:

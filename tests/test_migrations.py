@@ -48,6 +48,7 @@ _NEW_COLUMNS = {
     "owner_id",
     "derivation_reason",
     "source_experiment_id",
+    "deleted_at",
 }
 
 

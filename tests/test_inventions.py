@@ -127,11 +127,88 @@ def test_update_invention(db_session):
     assert updated.status == "완료"
 
 
-def test_delete_invention(db_session):
+def test_delete_moves_to_trash_without_removing_data(db_session):
+    """delete()는 소프트 삭제(휴지통 이동)다 — 데이터는 그대로 남는다."""
     service = InventionService(db_session)
     invention = service.create(make_input())
     service.delete(invention.id)
+
+    still_there = service.get(invention.id)
+    assert still_there is not None
+    assert still_there.deleted_at is not None
+
+
+def test_deleted_invention_excluded_from_default_list(db_session):
+    service = InventionService(db_session)
+    invention = service.create(make_input())
+    service.delete(invention.id)
+    assert invention.id not in [i.id for i in service.list()]
+
+
+def test_restore_brings_invention_back_to_default_list(db_session):
+    service = InventionService(db_session)
+    invention = service.create(make_input())
+    service.delete(invention.id)
+    service.restore(invention.id)
+
+    restored = service.get(invention.id)
+    assert restored.deleted_at is None
+    assert invention.id in [i.id for i in service.list()]
+
+
+def test_purge_actually_removes_the_row(db_session):
+    """purge()가 진짜 영구 삭제다 — 이전 delete()의 하드 삭제 동작을 대신한다."""
+    service = InventionService(db_session)
+    invention = service.create(make_input())
+    service.purge(invention.id)
     assert service.get(invention.id) is None
+
+
+def test_purge_impact_counts_related_data(db_session):
+    from src.experiments.schemas import ExperimentInput
+    from src.experiments.service import ExperimentService
+
+    service = InventionService(db_session)
+    invention = service.create(make_input())
+    ExperimentService(db_session).create(invention.id, ExperimentInput(results="실험 결과"))
+
+    impact = service.purge_impact(invention.id)
+    assert impact["experiments"] == 1
+    assert impact["timeline_events"] >= 1
+
+
+def test_list_trashed_shows_only_deleted_inventions(db_session):
+    service = InventionService(db_session)
+    kept = service.create(make_input(title="살아있는 발명"))
+    trashed = service.create(make_input(title="휴지통행 발명"))
+    service.delete(trashed.id)
+
+    trash_list = service.list_trashed()
+    assert [i.id for i in trash_list] == [trashed.id]
+    assert kept.id not in [i.id for i in trash_list]
+
+
+def test_delete_and_restore_log_timeline_events(db_session):
+    service = InventionService(db_session)
+    invention = service.create(make_input())
+    service.delete(invention.id)
+    service.restore(invention.id)
+
+    types = [e.event_type for e in service.list_timeline(invention.id)]
+    assert "moved_to_trash" in types
+    assert "restored_from_trash" in types
+
+
+def test_purging_parent_leaves_child_still_findable(db_session):
+    from src.inventions.schemas import QuickIdeaInput
+
+    service = InventionService(db_session)
+    parent = service.quick_create(QuickIdeaInput(memo="부모"))
+    child = service.create_child(parent.id, QuickIdeaInput(memo="자식"))
+
+    service.purge(parent.id)
+
+    assert child.id in [i.id for i in service.list()]
 
 
 def test_archive_invention_excluded_from_default_list(db_session):

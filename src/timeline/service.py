@@ -28,6 +28,8 @@ EVENT_LABELS: dict[str, str] = {
     "archived": "보관함으로 이동",
     "unarchived": "보관 해제",
     "markdown_exported": "Markdown 내보내기",
+    "moved_to_trash": "휴지통으로 이동",
+    "restored_from_trash": "휴지통에서 복원",
 }
 
 

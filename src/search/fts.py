@@ -246,12 +246,16 @@ class SearchIndexService:
         )
 
     def rebuild_all(self) -> int:
-        """모든 발명의 색인을 처음부터 다시 만든다. 마이그레이션/복구용."""
+        """모든 발명의 색인을 처음부터 다시 만든다. 마이그레이션/복구용.
+
+        휴지통에 있는 발명(deleted_at이 채워짐)은 검색 대상이 아니므로
+        건너뛴다 — 재색인해도 다시 나타나면 안 된다.
+        """
         from src.database.models import Invention
 
         self.session.execute(text(f"DELETE FROM {FTS_TABLE}"))
         count = 0
-        for invention in self.session.query(Invention):
+        for invention in self.session.query(Invention).filter(Invention.deleted_at.is_(None)):
             self.reindex_invention(invention.id)
             count += 1
         return count
@@ -259,11 +263,19 @@ class SearchIndexService:
     def check_integrity(self) -> SearchIndexReport:
         """색인이 비어 있지 않아도(발명 100개 중 95개만 색인됨 등) 부분
         손상을 잡아낸다. 앱 시작 때마다 돌리기엔 무겁지만, 설정 화면에서
-        사용자가 필요할 때 눌러 점검+복구할 수 있게 한다."""
+        사용자가 필요할 때 눌러 점검+복구할 수 있게 한다.
+
+        휴지통에 있는 발명은 애초에 색인 대상이 아니므로 비교 대상에서
+        제외한다 — 그렇지 않으면 정상적으로 색인에서 빠진 상태를 "고아
+        색인"이나 "오래된 색인"으로 잘못 판단하게 된다.
+        """
         from src.database.models import Invention
 
         invention_rows = {
-            inv_id: title for inv_id, title in self.session.query(Invention.id, Invention.title)
+            inv_id: title
+            for inv_id, title in self.session.query(Invention.id, Invention.title).filter(
+                Invention.deleted_at.is_(None)
+            )
         }
         indexed_rows = {
             row[0]: row[1]

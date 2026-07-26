@@ -32,7 +32,11 @@ class InventionRepository:
         return self.session.get(Invention, invention_id)
 
     def list_all(self, include_archived: bool = False) -> list[Invention]:
-        stmt = select(Invention).order_by(Invention.updated_at.desc())
+        stmt = (
+            select(Invention)
+            .where(Invention.deleted_at.is_(None))
+            .order_by(Invention.updated_at.desc())
+        )
         if not include_archived:
             stmt = stmt.where(Invention.is_archived.is_(False))
         return list(self.session.scalars(stmt))
@@ -40,7 +44,7 @@ class InventionRepository:
     def list_by_created(self, limit: int = 5) -> list[Invention]:
         stmt = (
             select(Invention)
-            .where(Invention.is_archived.is_(False))
+            .where(Invention.is_archived.is_(False), Invention.deleted_at.is_(None))
             .order_by(Invention.created_at.desc())
             .limit(limit)
         )
@@ -49,8 +53,20 @@ class InventionRepository:
     def list_children(self, invention_id: str) -> list[Invention]:
         stmt = (
             select(Invention)
-            .where(Invention.parent_invention_id == invention_id)
+            .where(
+                Invention.parent_invention_id == invention_id,
+                Invention.deleted_at.is_(None),
+            )
             .order_by(Invention.created_at.asc())
+        )
+        return list(self.session.scalars(stmt))
+
+    def list_trashed(self) -> list[Invention]:
+        """휴지통 목록. 최근에 지운 순서로 보여준다."""
+        stmt = (
+            select(Invention)
+            .where(Invention.deleted_at.is_not(None))
+            .order_by(Invention.deleted_at.desc())
         )
         return list(self.session.scalars(stmt))
 
@@ -68,7 +84,7 @@ class InventionRepository:
         결과 범위가 달라 보이지 않도록 맞춘 것이다. FTS 장애 상황에서만
         실행되므로 조금 느려도 괜찮다.
         """
-        stmt = select(Invention)
+        stmt = select(Invention).where(Invention.deleted_at.is_(None))
         if not include_archived:
             stmt = stmt.where(Invention.is_archived.is_(False))
         if keyword and keyword.strip():
@@ -131,7 +147,9 @@ class InventionRepository:
         """FTS 검색 결과(관련도 순 id 목록)를 그 순서 그대로 Invention으로 채운다."""
         if not invention_ids:
             return []
-        stmt = select(Invention).where(Invention.id.in_(invention_ids))
+        stmt = select(Invention).where(
+            Invention.id.in_(invention_ids), Invention.deleted_at.is_(None)
+        )
         if not include_archived:
             stmt = stmt.where(Invention.is_archived.is_(False))
         if technical_field:

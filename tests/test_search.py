@@ -216,8 +216,8 @@ def test_check_integrity_detects_orphaned_index(db_session):
 
     service = InventionService(db_session)
     inv = service.quick_create(QuickIdeaInput(memo="고아 색인 테스트"))
-    service.delete(inv.id)
-    # delete()가 정상적으로 색인도 지우므로, 고아 상태를 인위적으로 재현한다.
+    service.purge(inv.id)  # 실제로 행을 지워야 진짜 "고아" 색인 상태가 된다
+    # purge()가 정상적으로 색인도 지우므로, 고아 상태를 인위적으로 재현한다.
     db_session.execute(
         text(
             f"INSERT INTO {FTS_TABLE} (invention_id, invention_no, title, original_idea, "
