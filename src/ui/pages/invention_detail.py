@@ -9,11 +9,20 @@
 """
 from __future__ import annotations
 
+from datetime import date
+
 import streamlit as st
 
-from src.attachments.service import AttachmentError, AttachmentService, attachment_kind
+from src.attachments.service import (
+    ATTACHMENT_CATEGORIES,
+    AttachmentError,
+    AttachmentService,
+    attachment_kind,
+)
 from src.database.engine import get_session
 from src.drafts.store import DraftStore
+from src.experiments.schemas import ExperimentInput
+from src.experiments.service import ExperimentService
 from src.inventions.schemas import DETAIL_GROUPS, FIELD_LABELS, STATUS_VALUES
 from src.inventions.service import InventionService
 from src.reports.markdown_exporter import export_invention_markdown
@@ -54,6 +63,19 @@ def _render_header(invention) -> None:
 
     if cols[2].button("← 홈으로", key=f"back_{invention.id}"):
         go("home")
+
+    with get_session() as session:
+        tag_names = InventionService(session).tags.tag_names(invention.id)
+    tags_text = st.text_input(
+        "태그 (쉼표로 구분)",
+        value=", ".join(tag_names),
+        key=f"tags_{invention.id}",
+    )
+    if st.button("태그 저장", key=f"tags_save_{invention.id}"):
+        names = [t.strip() for t in tags_text.split(",") if t.strip()]
+        run_and_rerun(
+            lambda session: InventionService(session).set_tags(invention.id, names)
+        )
 
 
 def _render_original(invention) -> None:
@@ -131,6 +153,64 @@ def _render_group_editors(invention) -> None:
                 )
 
 
+def _render_experiments(invention) -> None:
+    with get_session() as session:
+        experiments = ExperimentService(session).list_for_invention(invention.id)
+
+    with st.expander(f"실험 기록 ({len(experiments)}건)", expanded=False):
+        st.caption("실험 날짜/조건/결과/실패 원인/개선 아이디어를 따로 남깁니다.")
+        with st.form(f"experiment_new_{invention.id}"):
+            has_date = st.checkbox("날짜 입력", value=True, key=f"exp_has_date_{invention.id}")
+            exp_date = (
+                st.date_input("실험 날짜", value=date.today(), key=f"exp_date_{invention.id}")
+                if has_date
+                else None
+            )
+            conditions = st.text_area("조건", key=f"exp_cond_{invention.id}")
+            results = st.text_area("결과", key=f"exp_result_{invention.id}")
+            failure_reason = st.text_area("실패 원인 (있다면)", key=f"exp_fail_{invention.id}")
+            improvement_ideas = st.text_area(
+                "개선 아이디어", key=f"exp_improve_{invention.id}"
+            )
+            submitted = st.form_submit_button("실험 기록 추가")
+
+        if submitted:
+            data = ExperimentInput(
+                experiment_date=exp_date,
+                conditions=conditions or None,
+                results=results or None,
+                failure_reason=failure_reason or None,
+                improvement_ideas=improvement_ideas or None,
+            )
+            errors = data.validate()
+            if errors:
+                for message in errors:
+                    st.error(message)
+            else:
+                run_and_rerun(
+                    lambda session: ExperimentService(session).create(invention.id, data)
+                )
+
+        for exp in experiments:
+            date_label = exp.experiment_date.isoformat() if exp.experiment_date else "날짜 미상"
+            with st.container(border=True):
+                st.markdown(f"**{date_label}**")
+                if exp.conditions:
+                    st.markdown(f"- 조건: {exp.conditions}")
+                if exp.results:
+                    st.markdown(f"- 결과: {exp.results}")
+                if exp.failure_reason:
+                    st.markdown(f"- 실패 원인: {exp.failure_reason}")
+                if exp.improvement_ideas:
+                    st.markdown(f"- 개선 아이디어: {exp.improvement_ideas}")
+                if st.button("삭제", key=f"exp_del_{exp.id}"):
+                    run_and_rerun(
+                        lambda session, exp_id=exp.id: ExperimentService(session).delete(
+                            exp_id
+                        )
+                    )
+
+
 def _render_attachments(invention) -> None:
     with get_session() as session:
         attachments = AttachmentService(session).list_for_invention(invention.id)
@@ -138,12 +218,15 @@ def _render_attachments(invention) -> None:
     with st.expander(f"사진·파일 ({len(attachments)}건)", expanded=False):
         uploaded = st.file_uploader(
             "파일 추가",
-            type=["png", "jpg", "jpeg", "pdf", "wav", "mp3", "m4a", "ogg", "webm"],
+            type=["png", "jpg", "jpeg", "pdf", "wav", "mp3", "m4a", "ogg", "webm", "mp4", "mov"],
             accept_multiple_files=True,
             key=f"att_up_{invention.id}",
         )
         photo = st.camera_input("사진 찍기", key=f"att_cam_{invention.id}")
         voice = st.audio_input("음성 메모", key=f"att_voice_{invention.id}")
+        category = st.selectbox(
+            "종류", ATTACHMENT_CATEGORIES, key=f"att_category_{invention.id}"
+        )
 
         if st.button("첨부 저장", key=f"att_save_{invention.id}"):
             items = [item for item in (photo, voice, *list(uploaded or [])) if item]
@@ -152,7 +235,7 @@ def _render_attachments(invention) -> None:
             else:
                 problems: list[str] = []
 
-                def _save_all(session, items=items, problems=problems):
+                def _save_all(session, items=items, problems=problems, category=category):
                     service = AttachmentService(session)
                     for item in items:
                         name = getattr(item, "name", None) or "voice-memo.wav"
@@ -162,6 +245,7 @@ def _render_attachments(invention) -> None:
                                 name,
                                 item.getvalue(),
                                 content_type=getattr(item, "type", None),
+                                category=category,
                             )
                         except AttachmentError as exc:
                             problems.append(f"{name}: {exc}")
@@ -172,18 +256,37 @@ def _render_attachments(invention) -> None:
             kind = attachment_kind(att.original_filename)
             with get_session() as session:
                 path = AttachmentService(session).resolve_path(att)
-            st.markdown(f"**{att.original_filename}**")
+            st.markdown(f"**{att.original_filename}** · {att.category}")
             if path.exists():
                 if kind == "image":
                     st.image(str(path), width=320)
                 elif kind == "audio":
                     st.audio(str(path))
+                elif kind == "video":
+                    st.video(str(path))
             if st.button("삭제", key=f"att_del_{att.id}"):
                 run_and_rerun(
                     lambda session, att_id=att.id: AttachmentService(
                         session
                     ).delete_by_id(att_id)
                 )
+
+
+def _render_timeline(invention) -> None:
+    with get_session() as session:
+        events = InventionService(session).list_timeline(invention.id)
+
+    with st.expander(f"Timeline ({len(events)}건)", expanded=False):
+        st.caption("이 발명이 시간이 지나며 어떻게 발전했는지 자동으로 기록됩니다.")
+        if not events:
+            st.caption("아직 기록된 사건이 없습니다.")
+            return
+
+        for event in events:
+            line = f"**{event.occurred_at.strftime('%Y-%m-%d %H:%M')}** · {event.title}"
+            if event.description:
+                line += f" — {event.description}"
+            st.markdown(line)
 
 
 def _render_history(invention) -> None:
@@ -278,6 +381,7 @@ def render(invention_id: str | None) -> None:
         st.divider()
         _render_group_editors(invention)
         st.divider()
+        _render_experiments(invention)
         _render_attachments(invention)
 
         with st.expander("비슷한 기술 찾아보기", expanded=False):
@@ -288,6 +392,7 @@ def render(invention_id: str | None) -> None:
 
             patent_search.render(invention.id)
 
+        _render_timeline(invention)
         _render_history(invention)
         _render_export(invention)
         _render_danger_zone(invention)

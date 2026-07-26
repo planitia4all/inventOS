@@ -74,7 +74,8 @@ def export_invention_markdown(
         parts.append(_section(index, title, getattr(invention, field_name, None)))
         index += 1
 
-    parts.append(_section(index, "검색 키워드", ", ".join(invention.keywords or [])))
+    tag_names = [link.tag.name for link in invention.tag_links]
+    parts.append(_section(index, "검색 키워드", ", ".join(tag_names)))
     index += 1
 
     parts.append(f"## {index}. 비슷한 기술(선행특허) 목록\n")

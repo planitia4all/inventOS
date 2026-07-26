@@ -25,6 +25,23 @@ class InventionRepository:
             stmt = stmt.where(Invention.is_archived.is_(False))
         return list(self.session.scalars(stmt))
 
+    def list_by_created(self, limit: int = 5) -> list[Invention]:
+        stmt = (
+            select(Invention)
+            .where(Invention.is_archived.is_(False))
+            .order_by(Invention.created_at.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(stmt))
+
+    def list_children(self, invention_id: str) -> list[Invention]:
+        stmt = (
+            select(Invention)
+            .where(Invention.parent_invention_id == invention_id)
+            .order_by(Invention.created_at.asc())
+        )
+        return list(self.session.scalars(stmt))
+
     def search(
         self,
         keyword: str | None = None,
@@ -32,6 +49,7 @@ class InventionRepository:
         status: str | None = None,
         include_archived: bool = False,
     ) -> list[Invention]:
+        """제목/원본만 보는 단순 검색 (FTS 색인이 없을 때의 대체 경로)."""
         stmt = select(Invention)
         if not include_archived:
             stmt = stmt.where(Invention.is_archived.is_(False))
@@ -48,6 +66,27 @@ class InventionRepository:
         stmt = stmt.order_by(Invention.updated_at.desc())
         return list(self.session.scalars(stmt))
 
+    def search_by_ids(
+        self,
+        invention_ids: list[str],
+        technical_field: str | None = None,
+        status: str | None = None,
+        include_archived: bool = False,
+    ) -> list[Invention]:
+        """FTS 검색 결과(관련도 순 id 목록)를 그 순서 그대로 Invention으로 채운다."""
+        if not invention_ids:
+            return []
+        stmt = select(Invention).where(Invention.id.in_(invention_ids))
+        if not include_archived:
+            stmt = stmt.where(Invention.is_archived.is_(False))
+        if technical_field:
+            stmt = stmt.where(Invention.technical_field == technical_field)
+        if status:
+            stmt = stmt.where(Invention.status == status)
+
+        by_id = {inv.id: inv for inv in self.session.scalars(stmt)}
+        return [by_id[i] for i in invention_ids if i in by_id]
+
     def delete(self, invention: Invention) -> None:
         self.session.delete(invention)
         self.session.flush()
@@ -62,7 +101,7 @@ class InventionRepository:
             suffix = invention_no[len(prefix):]
             if suffix.isdigit():
                 max_seq = max(max_seq, int(suffix))
-        return f"{prefix}{max_seq + 1:06d}"
+        return f"{prefix}{max_seq + 1:05d}"
 
     def add_revision(self, revision: InventionRevision) -> InventionRevision:
         self.session.add(revision)

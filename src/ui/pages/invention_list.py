@@ -21,7 +21,9 @@ def render() -> None:
     if st.button("➕ 새 아이디어 기록", type="primary", key="list_new"):
         go("capture")
 
-    keyword = st.text_input("검색", placeholder="제목이나 내용으로 찾기", key="list_search")
+    keyword = st.text_input(
+        "검색", placeholder="제목, 내용, 태그, 첨부파일 이름으로 찾기", key="list_search"
+    )
 
     with st.expander("자세한 조건", expanded=False):
         status = st.selectbox("상태", [_STATUS_ALL] + STATUS_VALUES, key="list_status")
@@ -51,7 +53,7 @@ def render() -> None:
                 title=("⭐ " if inv.is_favorite else "") + inv.title,
                 meta=meta,
                 body=inv.original_idea,
-                tags=inv.keywords or [],
+                tags=[link.tag.name for link in inv.tag_links],
             )
             if st.button("열어보기", key=f"list_open_{inv.id}"):
                 go("detail", inv.id)
