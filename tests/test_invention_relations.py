@@ -54,6 +54,38 @@ def test_no_children_returns_empty_list(db_session):
     assert service.list_children(parent.id) == []
 
 
+def test_deleting_parent_preserves_children(db_session):
+    """부모를 지워도 파생된 자식 아이디어 자체는 사라지면 안 된다."""
+    service = InventionService(db_session)
+    parent = service.quick_create(QuickIdeaInput(memo="부모 아이디어"))
+    child = service.create_child(parent.id, QuickIdeaInput(memo="자식 아이디어"))
+
+    service.delete(parent.id)
+
+    refreshed = service.get(child.id)
+    assert refreshed is not None
+    assert refreshed.parent_invention_id is None
+
+
+def test_derivation_chain_cannot_form_a_cycle(db_session):
+    """parent_invention_id는 create_child()에서 항상 새로 만든 자식에만
+    설정되므로(기존 발명을 나중에 재부모화하는 기능 자체가 없음) 구조적으로
+    순환이 생길 수 없다. 3단계 파생 체인으로 이를 문서화해 둔다."""
+    service = InventionService(db_session)
+    a = service.quick_create(QuickIdeaInput(memo="Separator 접합"))
+    b = service.create_child(a.id, QuickIdeaInput(memo="Graphene Fiber 방식"))
+    c = service.create_child(b.id, QuickIdeaInput(memo="Laser Hybrid 방식"))
+
+    chain = [c.id]
+    current = c
+    while current.parent_invention_id:
+        current = service.get(current.parent_invention_id)
+        assert current.id not in chain, "순환 관계가 발생했습니다"
+        chain.append(current.id)
+
+    assert chain == [c.id, b.id, a.id]
+
+
 def test_create_child_stores_derivation_reason(db_session):
     service = InventionService(db_session)
     parent = service.quick_create(QuickIdeaInput(memo="Separator 접합"))

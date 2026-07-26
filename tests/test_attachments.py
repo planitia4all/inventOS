@@ -58,6 +58,38 @@ def test_save_rejects_disallowed_extension(db_session, tmp_path):
         service.save(invention.id, "virus.exe", b"x")
 
 
+def test_save_rejects_oversized_file(db_session, tmp_path):
+    from src.attachments.service import MAX_ATTACHMENT_SIZE_BYTES
+
+    invention = make_invention(db_session)
+    service = make_service(db_session, tmp_path)
+    oversized = b"x" * (MAX_ATTACHMENT_SIZE_BYTES + 1)
+    with pytest.raises(AttachmentError):
+        service.save(invention.id, "huge.png", oversized)
+
+
+def test_save_accepts_file_at_size_limit(db_session, tmp_path):
+    invention = make_invention(db_session)
+    service = make_service(db_session, tmp_path)
+    att = service.save(invention.id, "ok.png", b"x" * 10)
+    assert att.original_filename == "ok.png"
+
+
+def test_korean_and_long_filenames_do_not_affect_storage(db_session, tmp_path):
+    """원본 파일명은 DB에만 저장되고, 실제 파일 경로는 항상 UUID를
+    사용하므로 한글/긴 파일명이 파일시스템 문제를 일으키지 않는다."""
+    invention = make_invention(db_session)
+    service = make_service(db_session, tmp_path)
+    long_korean_name = ("실험결과_" * 30) + ".png"
+    att = service.save(invention.id, long_korean_name, b"fake-bytes")
+
+    assert att.original_filename == long_korean_name
+    path = service.resolve_path(att)
+    assert path.exists()
+    # 실제 저장 파일명은 원본 파일명과 무관한 UUID 기반이다.
+    assert path.name != long_korean_name
+
+
 def test_save_video_extension_allowed(db_session, tmp_path):
     invention = make_invention(db_session)
     service = make_service(db_session, tmp_path)

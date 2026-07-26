@@ -11,7 +11,13 @@ import json
 import anthropic
 
 from src.ai.base import AIProviderError, PatentComparisonDraft, SearchTerms
-from src.ai.review import PROMPT_INSTRUCTIONS, build_context
+from src.ai.review import (
+    PROMPT_INSTRUCTIONS,
+    STRUCTURED_RESULT_SCHEMA,
+    InventionReviewResult,
+    build_context,
+    coerce_review_result,
+)
 from src.database.models import Invention, PatentDocument
 
 _SEARCH_TERMS_SCHEMA = {
@@ -100,6 +106,36 @@ class AnthropicProvider:
         except (ValueError, TypeError) as exc:
             raise AIProviderError("AI 응답을 JSON으로 해석할 수 없습니다.") from exc
 
+    def _call_json_lenient(self, prompt: str, schema: dict) -> tuple[dict | None, str]:
+        """`_call_json`과 달리 JSON 파싱 실패를 예외로 던지지 않는다.
+
+        (파싱된 dict 또는 실패 시 None, 원문 텍스트)를 돌려준다. 네트워크/
+        인증 실패나 정책 거부는 여전히 AIProviderError로 던진다 — 그건
+        재시도 말고는 복구할 방법이 없어서, 애초에 결과 자체가 없기
+        때문이다. 반면 "형식이 이상한 JSON"은 원문이라도 있으므로 예외
+        대신 값으로 돌려주고 호출한 쪽이 사용자에게 원문을 보여줄 수
+        있게 한다.
+        """
+        try:
+            response = self._client.messages.create(
+                model=self.model,
+                max_tokens=2048,
+                thinking={"type": "disabled"},
+                output_config={"format": {"type": "json_schema", "schema": schema}},
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except anthropic.APIError as exc:
+            raise AIProviderError(f"AI 호출에 실패했습니다: {exc}") from exc
+
+        if response.stop_reason == "refusal":
+            raise AIProviderError("AI가 이 요청을 처리할 수 없습니다 (정책상 거부).")
+
+        text = next((b.text for b in response.content if b.type == "text"), "")
+        try:
+            return json.loads(text), text
+        except (ValueError, TypeError):
+            return None, text
+
     def _call_text(self, prompt: str) -> str:
         try:
             response = self._client.messages.create(
@@ -171,12 +207,18 @@ additional_search_terms(추가 검색어), confidence(0~100 신뢰도)를 포함
         data = self._call_json(prompt, _COMPARISON_SCHEMA)
         return PatentComparisonDraft(**data)
 
-    def review_invention(self, invention: Invention, kind: str) -> str:
+    def review_invention(self, invention: Invention, kind: str) -> InventionReviewResult:
         instruction = PROMPT_INSTRUCTIONS.get(kind, "다음 발명을 검토하세요.")
         prompt = (
             f"{build_context(invention)}\n\n"
-            f"요청: {instruction}\n"
-            "한국어로, 발명 노트에 바로 옮겨 적을 수 있는 간결한 문장으로 답하세요. "
+            f"요청: {instruction}\n\n"
+            "problem, existing_method, limitations, core_idea, working_principle, "
+            "differentiation, expected_effects, implementation, experiment_plan, "
+            "patent_keywords(문자열 배열), findings 키를 모두 포함한 JSON으로 답하세요. "
+            "요청과 직접 관련된 항목만 채우고 나머지는 빈 문자열 또는 빈 배열로 "
+            "두되, 요청의 핵심 결론은 findings에 자유롭게 정리하세요. 한국어로 "
+            "답하고, 발명 노트에 바로 옮겨 적을 수 있는 간결한 문장을 쓰세요. "
             "법적 판단(신규성/진보성 등)이 아닌 검토 참고용임을 유의하세요."
         )
-        return self._call_text(prompt)
+        data, raw_text = self._call_json_lenient(prompt, STRUCTURED_RESULT_SCHEMA)
+        return coerce_review_result(data, raw_text)

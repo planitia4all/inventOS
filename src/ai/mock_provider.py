@@ -8,7 +8,13 @@ from __future__ import annotations
 import re
 
 from src.ai.base import PatentComparisonDraft, SearchTerms
-from src.ai.review import PROMPT_INSTRUCTIONS, REVIEW_KIND_LABELS
+from src.ai.review import (
+    PROMPT_INSTRUCTIONS,
+    REVIEW_DEFAULT_FIELD,
+    REVIEW_KIND_LABELS,
+    STRUCTURED_FIELD_MAP,
+    InventionReviewResult,
+)
 from src.database.models import Invention, PatentDocument
 
 _STOPWORDS = {"the", "a", "an", "of", "and", "or", "to", "for", "is", "with", "in", "on"}
@@ -78,13 +84,22 @@ class MockAIProvider:
             confidence=0,
         )
 
-    def review_invention(self, invention: Invention, kind: str) -> str:
+    def review_invention(self, invention: Invention, kind: str) -> InventionReviewResult:
         label = REVIEW_KIND_LABELS.get(kind, kind)
         instruction = PROMPT_INSTRUCTIONS.get(kind, "")
         base_text = (invention.original_idea or invention.title or "").strip()
         snippet = base_text[:80] + ("..." if len(base_text) > 80 else "")
-        return (
-            f"[Mock {label}]\n{instruction}\n\n"
-            f"원본 요약: {snippet}\n"
+        text = (
+            f"[Mock {label}] {instruction} "
+            f"원본 요약: {snippet} "
             "(실제 AI Provider를 설정하면 더 구체적인 결과를 받을 수 있습니다.)"
         )
+
+        result = InventionReviewResult(raw_text=text, findings=text)
+        if kind == "patent_search_terms":
+            result.patent_keywords = _extract_keywords(base_text, limit=6) or [invention.title]
+        else:
+            invention_field = REVIEW_DEFAULT_FIELD.get(kind, "review_notes")
+            structured_key = STRUCTURED_FIELD_MAP.get(invention_field, "findings")
+            setattr(result, structured_key, text)
+        return result

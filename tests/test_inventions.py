@@ -35,6 +35,43 @@ def test_invention_no_increments_sequentially(db_session):
     assert second_seq == first_seq + 1
 
 
+def test_invention_no_resets_per_year(db_session):
+    from src.inventions.repository import InventionRepository
+
+    repo = InventionRepository(db_session)
+    assert repo.next_invention_no(2026) == "INV-2026-00001"
+    assert repo.next_invention_no(2027) == "INV-2027-00001"
+
+
+def test_invention_no_is_5_digit_padded(db_session):
+    service = InventionService(db_session)
+    invention = service.create(make_input())
+    suffix = invention.invention_no.split("-")[-1]
+    assert len(suffix) == 5
+    assert suffix.isdigit()
+
+
+def test_duplicate_invention_no_rejected_at_db_level(db_session):
+    """next_invention_no()가 계산을 잘못하더라도(예: 동시 생성 경합), DB의
+    UNIQUE 제약이 마지막 방어선으로 중복 발명번호 저장을 막아야 한다."""
+    from sqlalchemy.exc import IntegrityError
+
+    from src.database.models import Invention
+
+    service = InventionService(db_session)
+    existing = service.create(make_input())
+
+    duplicate = Invention(
+        invention_no=existing.invention_no,  # 일부러 같은 번호 사용
+        title="중복 번호 테스트",
+        original_idea="본문",
+    )
+    db_session.add(duplicate)
+    with pytest.raises(IntegrityError):
+        db_session.flush()
+    db_session.rollback()
+
+
 def test_update_invention(db_session):
     service = InventionService(db_session)
     invention = service.create(make_input())

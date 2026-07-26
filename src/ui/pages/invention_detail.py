@@ -22,6 +22,7 @@ from src.ai.review import (
     REVIEW_DEFAULT_FIELD,
     REVIEW_GROUPS,
     build_context,
+    render_review_result,
 )
 from src.attachments.service import (
     ATTACHMENT_CATEGORIES,
@@ -34,7 +35,8 @@ from src.database.engine import get_session
 from src.drafts.store import DraftStore
 from src.experiments.schemas import ExperimentInput
 from src.experiments.service import ExperimentService, draft_text_from_experiment
-from src.inventions.schemas import DERIVATION_COPY_FIELDS, DETAIL_GROUPS, FIELD_LABELS, STATUS_VALUES
+from src.timeline.service import TimelineService
+from src.inventions.schemas import DETAIL_GROUPS, FIELD_LABELS, STATUS_VALUES
 from src.inventions.service import InventionService
 from src.reports.markdown_exporter import export_invention_markdown
 from src.ui.components.actions import run_and_rerun
@@ -187,12 +189,21 @@ def _run_ai_review(invention_id: str, kind: str, label: str) -> None:
             with get_session() as read_session:
                 fresh = InventionService(read_session).get(invention_id)
                 context = build_context(fresh)
-                content = provider.review_invention(fresh, kind)
+                review = provider.review_invention(fresh, kind)
         model_name = getattr(provider, "model", None)
+        rendered = render_review_result(review)
+        structured = review.to_dict()
         run_and_rerun(
-            lambda session, k=kind, c=content, ctx=context, pname=provider.name, m=model_name: (
+            lambda session, k=kind, c=rendered, ctx=context, pname=provider.name, m=model_name, s=structured, pe=review.parse_error: (
                 AIResultService(session).create_draft(
-                    invention_id, k, c, provider=pname, model=m, input_snapshot=ctx
+                    invention_id,
+                    k,
+                    c,
+                    provider=pname,
+                    model=m,
+                    input_snapshot=ctx,
+                    structured_content=s,
+                    parse_error=pe,
                 )
             )
         )
@@ -241,6 +252,8 @@ def _render_ai_results(invention) -> None:
                 if r.model:
                     meta += f"/{r.model}"
                 st.caption(meta)
+                if r.parse_error:
+                    st.caption(f"⚠️ {r.parse_error} (아래 내용은 AI 원문입니다)")
                 st.write(r.content)
 
                 if r.status == "생성됨":
@@ -446,12 +459,23 @@ def _render_attachments(invention) -> None:
                 path = AttachmentService(session).resolve_path(att)
             st.markdown(f"**{att.original_filename}** · {att.category}")
             if path.exists():
-                if kind == "image":
-                    st.image(str(path), width=320)
-                elif kind == "audio":
-                    st.audio(str(path))
-                elif kind == "video":
-                    st.video(str(path))
+                try:
+                    if kind == "image":
+                        st.image(str(path), width=320)
+                    elif kind == "audio":
+                        st.audio(str(path))
+                    elif kind == "video":
+                        st.video(str(path))
+                except Exception:
+                    # 손상되었거나 재생할 수 없는 파일이어도 화면 전체가
+                    # 죽지 않게 한다 — 기록(파일명/종류/삭제 버튼)은 계속 보여준다.
+                    st.caption("⚠️ 미리보기를 표시할 수 없는 파일입니다.")
+            else:
+                st.warning(
+                    "⚠️ 실제 파일을 찾을 수 없습니다 (이동되었거나 다른 기기의 "
+                    "data 폴더에만 있을 수 있습니다). 기록은 남아 있으니 필요하면 "
+                    "다시 첨부하세요."
+                )
             if st.button("삭제", key=f"att_del_{att.id}"):
                 run_and_rerun(
                     lambda session, att_id=att.id: AttachmentService(
@@ -508,19 +532,27 @@ def _render_history(invention) -> None:
 def _render_export(invention) -> None:
     with st.expander("내보내기", expanded=False):
         markdown = export_invention_markdown(invention, list(invention.patent_links))
-        st.download_button(
+        downloaded = st.download_button(
             "Markdown 파일로 저장",
             data=markdown.encode("utf-8"),
             file_name=f"{invention.invention_no}.md",
             mime="text/markdown",
             key=f"md_{invention.id}",
         )
+        if downloaded:
+            with get_session() as session:
+                TimelineService(session).log(invention.id, "markdown_exported")
 
 
 def _render_danger_zone(invention) -> None:
     with st.expander("보관 / 삭제", expanded=False):
+        st.caption(
+            "더 이상 진행하지 않는 아이디어는 지우지 말고 '보관하기'를 "
+            "권장합니다 — 목록에서만 숨겨지고 기록은 그대로 남아 언제든 "
+            "다시 꺼내볼 수 있습니다."
+        )
         if st.button(
-            "보관 해제" if invention.is_archived else "보관하기",
+            "보관 해제" if invention.is_archived else "📦 보관하기",
             key=f"arch_{invention.id}",
         ):
             run_and_rerun(
@@ -529,12 +561,18 @@ def _render_danger_zone(invention) -> None:
                 )
             )
 
+        st.markdown("---")
         confirm_key = f"confirm_del_{invention.id}"
-        if st.button("삭제", key=f"del_{invention.id}"):
+        if st.button("🗑️ 완전히 삭제", key=f"del_{invention.id}"):
             st.session_state[confirm_key] = True
 
         if st.session_state.get(confirm_key):
-            st.warning(f"'{invention.title}'을(를) 삭제합니다. 되돌릴 수 없습니다.")
+            st.warning(
+                f"'{invention.title}'과(와) 여기 딸린 실험 기록·AI 검토 결과·"
+                "첨부파일·연결된 선행특허·Timeline이 모두 영구적으로 삭제됩니다. "
+                "되돌릴 수 없습니다. (파생된 자식 아이디어는 삭제되지 않고 "
+                "부모 연결만 끊깁니다.) 정말 삭제하려면 확정을 눌러주세요."
+            )
             cols = st.columns(2)
             if cols[0].button("삭제 확정", key=f"del_ok_{invention.id}"):
                 with get_session() as session:

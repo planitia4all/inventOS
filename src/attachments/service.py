@@ -22,6 +22,10 @@ AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg", ".webm"}
 VIDEO_EXTENSIONS = {".mp4", ".mov"}
 ALLOWED_EXTENSIONS = IMAGE_EXTENSIONS | DOCUMENT_EXTENSIONS | AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
 
+# 로컬 단일 사용자 프로그램이라도 실수로 아주 큰 파일(예: 편집 안 된 원본
+# 동영상)을 올려서 디스크를 가득 채우는 것은 막아 둔다.
+MAX_ATTACHMENT_SIZE_BYTES = 200 * 1024 * 1024  # 200MB
+
 _DEFAULT_CATEGORY_BY_EXTENSION: dict[str, str] = {
     **{ext: "사진" for ext in IMAGE_EXTENSIONS},
     **{ext: "음성" for ext in AUDIO_EXTENSIONS},
@@ -73,6 +77,12 @@ class AttachmentService:
                 f"허용되지 않은 파일 형식입니다: {ext} "
                 "(사진 PNG/JPG, 문서 PDF, 음성 WAV/MP3/M4A/OGG/WEBM, "
                 "동영상 MP4/MOV만 가능)"
+            )
+        if len(content) > MAX_ATTACHMENT_SIZE_BYTES:
+            limit_mb = MAX_ATTACHMENT_SIZE_BYTES // (1024 * 1024)
+            raise AttachmentError(
+                f"파일이 너무 큽니다 (최대 {limit_mb}MB). "
+                "동영상은 압축한 뒤 다시 시도하세요."
             )
 
         target_dir = self.settings.attachments_dir / invention_id
@@ -142,8 +152,12 @@ class AttachmentService:
         except OSError:
             pass
         invention_id = attachment.invention_id
+        original_filename = attachment.original_filename
         self.session.delete(attachment)
         self.session.flush()
+        TimelineService(self.session).log(
+            invention_id, "attachment_removed", description=original_filename
+        )
         SearchIndexService(self.session).reindex_invention(invention_id)
 
     def delete_by_id(self, attachment_id: str) -> None:

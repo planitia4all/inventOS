@@ -18,8 +18,14 @@ from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from src.ai.review import PARTIAL_APPLY_FIELD_LABELS, REVIEW_DEFAULT_FIELD, REVIEW_KIND_LABELS
+from src.ai.review import (
+    PARTIAL_APPLY_FIELD_LABELS,
+    REVIEW_DEFAULT_FIELD,
+    REVIEW_KIND_LABELS,
+    apply_structured_value,
+)
 from src.database.models import InventionAIResult
+from src.search.fts import SearchIndexService
 from src.timeline.service import TimelineService
 
 # 자유 문자열 — 새 종류를 추가해도 스키마 변경이 필요 없다. "AI로 검토하기"의
@@ -48,6 +54,8 @@ class AIResultService:
         provider: str = "mock",
         model: str | None = None,
         input_snapshot: str | None = None,
+        structured_content: dict | None = None,
+        parse_error: str | None = None,
     ) -> InventionAIResult:
         result = InventionAIResult(
             invention_id=invention_id,
@@ -57,10 +65,13 @@ class AIResultService:
             provider=provider,
             model=model,
             input_snapshot=input_snapshot,
+            structured_content=structured_content,
+            parse_error=parse_error,
             status=STATUS_CREATED,
         )
         self.session.add(result)
         self.session.flush()
+        SearchIndexService(self.session).reindex_invention(invention_id)
         return result
 
     def list_for_invention(
@@ -127,8 +138,13 @@ class AIResultService:
         )
 
         for field in fields:
+            # 구조화된 응답에서 이 필드에 해당하는 값이 있으면 그 값만
+            # 정확히 반영한다("일부만 반영"의 정확도). 구조화 데이터가
+            # 없거나(예: Mock/파싱 실패) 이 필드에 대응하는 값이 비어
+            # 있으면 결과 전체 텍스트로 대체한다 — 항상 뭔가는 반영된다.
+            value = apply_structured_value(result.structured_content, field) or result.content
             existing = getattr(invention, field) or ""
-            merged = f"{existing}\n\n{result.content}".strip() if existing else result.content
+            merged = f"{existing}\n\n{value}".strip() if existing else value
             setattr(invention, field, merged)
         self.session.flush()
 
@@ -145,6 +161,7 @@ class AIResultService:
             description=f"{RESULT_KINDS.get(result.kind, result.kind)} → {field_labels}",
             meta={"kind": result.kind, "applied_fields": fields},
         )
+        SearchIndexService(self.session).reindex_invention(result.invention_id)
         return result
 
     def archive(self, result_id: str) -> InventionAIResult | None:
@@ -165,3 +182,4 @@ class AIResultService:
         if result is not None:
             result.status = STATUS_DELETED
             self.session.flush()
+            SearchIndexService(self.session).reindex_invention(result.invention_id)
