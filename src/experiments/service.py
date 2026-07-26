@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from src.database.models import Experiment
 from src.experiments.schemas import ExperimentInput
+from src.search.fts import SearchIndexService
 from src.timeline.service import TimelineService
 
 
@@ -58,6 +59,7 @@ class ExperimentService:
             "experiment_recorded",
             description=data.results or data.conditions or "실험 기록 추가",
         )
+        SearchIndexService(self.session).reindex_invention(invention_id)
         return experiment
 
     def update(self, experiment_id: str, data: ExperimentInput) -> Experiment:
@@ -72,6 +74,12 @@ class ExperimentService:
         experiment.failure_reason = data.failure_reason
         experiment.improvement_ideas = data.improvement_ideas
         self.session.flush()
+        TimelineService(self.session).log(
+            experiment.invention_id,
+            "experiment_updated",
+            description=data.results or data.conditions or "실험 기록 수정",
+        )
+        SearchIndexService(self.session).reindex_invention(experiment.invention_id)
         return experiment
 
     def get(self, experiment_id: str) -> Experiment | None:
@@ -86,7 +94,15 @@ class ExperimentService:
         return list(self.session.scalars(stmt))
 
     def delete(self, experiment_id: str) -> None:
-        self.session.delete(self._require(experiment_id))
+        experiment = self._require(experiment_id)
+        invention_id = experiment.invention_id
+        description = experiment.results or experiment.conditions or "실험 기록 삭제"
+        self.session.delete(experiment)
+        self.session.flush()
+        TimelineService(self.session).log(
+            invention_id, "experiment_deleted", description=description
+        )
+        SearchIndexService(self.session).reindex_invention(invention_id)
 
     def _require(self, experiment_id: str) -> Experiment:
         experiment = self.session.get(Experiment, experiment_id)

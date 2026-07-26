@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from src.ai.review import InventionReviewResult
 from src.database.models import Invention, PatentDocument
 
 
@@ -72,10 +73,12 @@ class AIProvider(Protocol):
     ) -> PatentComparisonDraft:
         ...
 
-    def review_invention(self, invention: Invention, kind: str) -> str:
+    def review_invention(self, invention: Invention, kind: str) -> InventionReviewResult:
         """'AI로 검토하기'의 한 항목(예: 아이디어 정리, 실현 가능성 검토)을 실행한다.
 
-        결과 텍스트만 반환한다 — 발명 내용을 저장/수정하는 것은 이 함수의
-        책임이 아니다 (호출한 쪽이 InventionAIResult로 별도 저장한다).
+        모든 검토 종류가 같은 구조화 형식(InventionReviewResult)으로 응답한다
+        — Mock/Anthropic 등 어떤 Provider를 쓰든 파싱/오류 처리 코드가
+        하나로 유지된다. 발명 내용을 저장/수정하는 것은 이 함수의 책임이
+        아니다 (호출한 쪽이 InventionAIResult로 별도 저장한다).
         """
         ...

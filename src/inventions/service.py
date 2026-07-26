@@ -263,6 +263,7 @@ class InventionService:
         invention.status = data.status or invention.status
         for name in _CONTENT_FIELDS:
             setattr(invention, name, getattr(data, name))
+        old_tags = set(self.tags.tag_names(invention.id))
         self.tags.set_tags_for_invention(invention.id, data.keywords or [])
         self.session.flush()
 
@@ -272,6 +273,9 @@ class InventionService:
                 "status_changed",
                 description=f"{old_status} → {invention.status}",
             )
+        new_tags = set(self.tags.tag_names(invention.id))
+        if new_tags != old_tags:
+            self._log_tags_changed(invention.id, new_tags)
         self.search_index.reindex_invention(invention.id)
         return invention
 
@@ -326,8 +330,19 @@ class InventionService:
 
     def set_tags(self, invention_id: str, names: list[str]) -> None:
         self._require(invention_id)
+        old_tags = set(self.tags.tag_names(invention_id))
         self.tags.set_tags_for_invention(invention_id, names)
+        new_tags = set(self.tags.tag_names(invention_id))
+        if new_tags != old_tags:
+            self._log_tags_changed(invention_id, new_tags)
         self.search_index.reindex_invention(invention_id)
+
+    def _log_tags_changed(self, invention_id: str, new_tags: set[str]) -> None:
+        self.timeline.log(
+            invention_id,
+            "tags_changed",
+            description=", ".join(sorted(new_tags)) if new_tags else "(태그 없음)",
+        )
 
     # ------------------------------------------------------------------
     # 조회

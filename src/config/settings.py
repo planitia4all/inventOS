@@ -15,6 +15,10 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 load_dotenv(_PROJECT_ROOT / ".env")
 
+# 설정 화면 "앱 정보"에 표시하는 버전. 사용자에게 보여주는 용도일 뿐 자동
+# 업데이트 체크 등에는 쓰지 않는다.
+APP_VERSION = "0.4.0"
+
 
 def _mask(value: str | None) -> str:
     """UI/로그 표시용으로 키를 마스킹한다."""

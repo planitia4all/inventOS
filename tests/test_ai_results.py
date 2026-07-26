@@ -216,3 +216,70 @@ def test_discard_is_soft_delete_hidden_from_default_list(db_session):
     assert service.list_for_invention(invention.id) == []
     all_results = service.list_for_invention(invention.id, include_deleted=True)
     assert [r.status for r in all_results] == ["삭제됨"]
+
+
+def test_create_draft_stores_structured_content_and_parse_error(db_session):
+    invention = make_invention(db_session)
+    structured = {"problem": "구조화된 문제 설명", "patent_keywords": ["A", "B"]}
+    draft = AIResultService(db_session).create_draft(
+        invention.id,
+        "problem_extraction",
+        "렌더링된 텍스트",
+        structured_content=structured,
+        parse_error="일부 항목이 누락되었습니다",
+    )
+
+    assert draft.structured_content == structured
+    assert draft.parse_error == "일부 항목이 누락되었습니다"
+
+
+def test_apply_uses_structured_value_for_matching_field(db_session):
+    """일부만 반영할 때, 구조화된 응답이 있으면 해당 필드에 정확히 맞는
+    값만 반영되고 관련 없는 다른 항목의 텍스트가 섞이지 않아야 한다."""
+    invention = make_invention(db_session)
+    service = AIResultService(db_session)
+    structured = {
+        "problem": "정확한 문제 설명",
+        "core_idea": "정확한 핵심 아이디어",
+    }
+    draft = service.create_draft(
+        invention.id,
+        "summary",
+        "AI 결과 전체 렌더링 텍스트(문제+핵심아이디어 다 섞여 있음)",
+        structured_content=structured,
+    )
+
+    service.apply(draft.id, target_fields=["problem_to_solve", "core_principle"])
+
+    refreshed = InventionService(db_session).get(invention.id)
+    assert refreshed.problem_to_solve == "정확한 문제 설명"
+    assert refreshed.core_principle == "정확한 핵심 아이디어"
+
+
+def test_apply_falls_back_to_full_content_when_structured_field_empty(db_session):
+    invention = make_invention(db_session)
+    service = AIResultService(db_session)
+    draft = service.create_draft(
+        invention.id,
+        "summary",
+        "전체 내용으로 대체됨",
+        structured_content={"problem": ""},  # 이 필드는 비어 있음
+    )
+
+    service.apply(draft.id, target_fields=["problem_to_solve"])
+
+    refreshed = InventionService(db_session).get(invention.id)
+    assert refreshed.problem_to_solve == "전체 내용으로 대체됨"
+
+
+def test_apply_without_structured_content_uses_full_content(db_session):
+    """Mock/파싱 실패 등으로 structured_content가 없어도 기존처럼 동작해야 한다."""
+    invention = make_invention(db_session)
+    service = AIResultService(db_session)
+    draft = service.create_draft(invention.id, "summary", "구조화 없는 결과")
+
+    service.apply(draft.id, target_fields=["problem_to_solve", "core_principle"])
+
+    refreshed = InventionService(db_session).get(invention.id)
+    assert refreshed.problem_to_solve == "구조화 없는 결과"
+    assert refreshed.core_principle == "구조화 없는 결과"

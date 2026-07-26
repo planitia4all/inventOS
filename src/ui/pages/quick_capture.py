@@ -161,10 +161,12 @@ def render() -> None:
         st.caption("작성 중인 내용은 자동으로 임시 저장됩니다.")
 
     with st.expander("제목·태그 (선택)", expanded=False):
-        title = st.text_input(
+        # 값은 위젯 key(capture_title/capture_tags)를 통해 session_state에서
+        # 바로 읽으므로(저장 버튼 핸들러 참고) 반환값을 따로 저장할 필요는 없다.
+        st.text_input(
             "제목", key="capture_title", placeholder="비워두면 자동으로 만들어집니다"
         )
-        tags_text = st.text_input(
+        st.text_input(
             "태그", key="capture_tags", placeholder="쉼표로 구분 (예: 유리기판, 관통전극)"
         )
 

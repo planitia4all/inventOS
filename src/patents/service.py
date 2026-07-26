@@ -129,6 +129,9 @@ class PatentService:
         link.importance = data.importance
         link.review_status = data.review_status
         self.session.flush()
+        TimelineService(self.session).log(
+            link.invention_id, "prior_art_updated", description=link.patent.title
+        )
         return link
 
     def set_similarity_score(self, link_id: str, score: float) -> InventionPatentLink:
@@ -143,7 +146,12 @@ class PatentService:
         link = self.repo.get_link(link_id)
         if link is None:
             raise LookupError(f"연결 정보를 찾을 수 없습니다: {link_id}")
+        invention_id = link.invention_id
+        patent_title = link.patent.title
         self.repo.delete_link(link)
+        TimelineService(self.session).log(
+            invention_id, "prior_art_unlinked", description=patent_title
+        )
 
     def save_patent_translation(self, patent_id: str, translated_ko: str) -> PatentDocument:
         patent = self.repo.get(patent_id)

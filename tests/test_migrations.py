@@ -198,3 +198,96 @@ def test_migration_backfill_is_idempotent(tmp_path):
             text("SELECT COUNT(*) FROM invention_tags WHERE invention_id='id-4'")
         ).scalar()
     assert count == 1
+
+
+def test_migration_upgrades_old_fts_schema_and_rebuilds(tmp_path):
+    """예전(컬럼이 더 적은) FTS5 색인 테이블이 있는 DB를 열면, 테이블을
+    새 스키마로 다시 만들고 기존 발명들로 색인을 재구축해야 한다."""
+    from src.database.models import Base, Invention
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'old_fts.db'}")
+    Base.metadata.create_all(engine)
+    with engine.begin() as conn:
+        # search/fts.py가 예전에 썼던 5개 컬럼짜리 스키마를 흉내낸다.
+        conn.execute(
+            text(
+                """
+                CREATE VIRTUAL TABLE invention_search_index USING fts5(
+                    invention_id UNINDEXED, title, original_idea,
+                    content_text, tags, attachment_names
+                )
+                """
+            )
+        )
+
+    from sqlalchemy.orm import sessionmaker
+
+    session = sessionmaker(bind=engine)()
+    try:
+        session.add(
+            Invention(
+                id="id-5",
+                invention_no="INV-2026-00005",
+                title="예전 색인 테스트",
+                original_idea="본문",
+                status="아이디어",
+                version=1,
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+    run_migrations(engine)
+
+    columns = {
+        row[1] for row in engine.connect().execute(text("PRAGMA table_info(invention_search_index)"))
+    }
+    assert {"invention_no", "experiment_text", "ai_results_text"}.issubset(columns)
+
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT invention_id FROM invention_search_index "
+                "WHERE invention_search_index MATCH '예전'"
+            )
+        ).first()
+    assert row is not None
+    assert row[0] == "id-5"
+
+
+def test_migration_backs_up_db_file_before_altering_schema(tmp_path):
+    engine = _old_db(tmp_path)
+
+    run_migrations(engine)
+
+    backups = list(tmp_path.glob("old_backup_*.db"))
+    assert len(backups) == 1
+    # 백업본에는 마이그레이션 이전 원본 데이터가 그대로 들어 있어야 한다.
+    from sqlalchemy import create_engine as _create_engine
+
+    backup_engine = _create_engine(f"sqlite:///{backups[0]}")
+    with backup_engine.connect() as conn:
+        row = conn.execute(text("SELECT title FROM inventions WHERE id='id-1'")).one()
+    assert row.title == "옛 발명"
+
+
+def test_migration_does_not_backup_when_schema_already_current(tmp_path):
+    from src.database.models import Base
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'fresh.db'}")
+    Base.metadata.create_all(engine)
+
+    run_migrations(engine)
+
+    assert list(tmp_path.glob("fresh_backup_*.db")) == []
+
+
+def test_migration_backup_is_only_created_once_across_repeated_runs(tmp_path):
+    engine = _old_db(tmp_path)
+
+    run_migrations(engine)  # 스키마가 바뀌므로 백업 1개 생성
+    run_migrations(engine)  # 이미 최신 스키마이므로 추가 백업 없음
+
+    backups = list(tmp_path.glob("old_backup_*.db"))
+    assert len(backups) == 1

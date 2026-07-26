@@ -16,6 +16,9 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
+from datetime import datetime
+from pathlib import Path
 
 from sqlalchemy import Engine, inspect, select, text
 from sqlalchemy.orm import Session, sessionmaker
@@ -47,6 +50,8 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "input_snapshot": "TEXT",
         "applied_fields": "JSON",
         "status": "VARCHAR(20) DEFAULT '생성됨'",
+        "structured_content": "JSON",
+        "parse_error": "TEXT",
     },
 }
 
@@ -57,12 +62,52 @@ def run_migrations(engine: Engine) -> list[str]:
     반환값은 실제로 추가한 컬럼 이름 목록이다 (데이터 마이그레이션은
     포함하지 않는다 — 그건 로그로만 남긴다).
     """
+    if _needs_column_migration(engine):
+        _backup_db_file(engine)
     applied = _add_missing_columns(engine)
     _remap_legacy_status_values(engine)
     _backfill_tags_from_keywords(engine)
     _backfill_ai_result_status(engine)
     _ensure_search_index(engine)
     return applied
+
+
+def _needs_column_migration(engine: Engine) -> bool:
+    """실제로 ALTER TABLE이 필요한지 미리 확인한다 (백업 여부 판단용)."""
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    for table, columns in _ADDED_COLUMNS.items():
+        if table not in existing_tables:
+            continue
+        present = {col["name"] for col in inspector.get_columns(table)}
+        if set(columns) - present:
+            return True
+    return False
+
+
+def _backup_db_file(engine: Engine) -> Path | None:
+    """스키마를 바꾸기 전에 SQLite 파일을 통째로 복사해 둔다.
+
+    새 DB(파일이 아직 없거나 비어 있음)나 in-memory DB에서는 아무 일도
+    하지 않는다 — 백업할 기존 데이터가 없기 때문이다. 백업 자체가
+    실패해도(디스크 꽉 참 등) 마이그레이션을 막지는 않는다 — 로그만 남긴다.
+    """
+    try:
+        url = engine.url
+        if url.get_backend_name() != "sqlite" or not url.database:
+            return None
+        db_path = Path(url.database)
+        if db_path.name == ":memory:" or not db_path.exists() or db_path.stat().st_size == 0:
+            return None
+
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        backup_path = db_path.with_name(f"{db_path.stem}_backup_{timestamp}{db_path.suffix}")
+        shutil.copy2(db_path, backup_path)
+        logger.info("스키마 변경 전 DB를 백업했습니다: %s", backup_path)
+        return backup_path
+    except OSError as exc:
+        logger.warning("Migration 전 DB 백업에 실패했습니다 (계속 진행합니다): %s", exc)
+        return None
 
 
 def _add_missing_columns(engine: Engine) -> list[str]:

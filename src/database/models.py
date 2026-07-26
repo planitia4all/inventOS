@@ -110,9 +110,14 @@ class Invention(Base):
         back_populates="invention", cascade="all, delete-orphan"
     )
 
+    # cascade에 "delete"를 넣지 않는다 — 부모를 지운다고 파생된 자식
+    # 아이디어까지 함께 사라지면 안 된다("all"에는 delete가 포함돼 있어서
+    # 예전에는 부모 삭제 시 전체 파생 트리가 통째로 삭제되는 버그가 있었다).
+    # 부모가 삭제되면 SQLAlchemy가 자식의 parent_invention_id를 NULL로
+    # 바꿔서 관계만 끊고 자식 데이터는 그대로 보존한다.
     children: Mapped[list["Invention"]] = relationship(
         back_populates="parent",
-        cascade="all",
+        cascade="save-update, merge",
         remote_side="Invention.parent_invention_id",
         foreign_keys="[Invention.parent_invention_id]",
         single_parent=False,
@@ -232,6 +237,12 @@ class InventionAIResult(Base):
     # AI에게 실제로 넘긴 입력(원본 메모 + 관련 필드 요약). 나중에 "무엇을 보고
     # 이 결과가 나왔는지" 추적할 수 있도록 결과와 함께 그대로 저장해 둔다.
     input_snapshot: Mapped[str | None] = mapped_column(Text)
+    # 구조화된 응답(src.ai.review.InventionReviewResult.to_dict()). Provider가
+    # 형식에 안 맞는 응답을 줘서 파싱하지 못했으면 None — 그래도 content에는
+    # 항상 원문이 남아 있어서 사용자가 읽고 "전체 반영"할 수 있다.
+    structured_content: Mapped[dict | None] = mapped_column(JSON)
+    # 구조화 파싱에 문제가 있었을 때 그 이유. 문제 없으면 None.
+    parse_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     # 적용 전에는 둘 다 None. 적용하는 순간 시각과 반영된 발명 필드명이 채워진다.
     applied_at: Mapped[datetime | None] = mapped_column(DateTime)

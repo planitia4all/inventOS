@@ -13,14 +13,21 @@ EVENT_LABELS: dict[str, str] = {
     "original_revised": "원본 아이디어 수정",
     "content_updated": "발명 내용 수정",
     "status_changed": "상태 변경",
+    "tags_changed": "태그 변경",
     "attachment_added": "첨부파일 추가",
+    "attachment_removed": "첨부파일 삭제",
     "prior_art_linked": "비슷한 기술 연결",
+    "prior_art_updated": "비슷한 기술 비교 기록 수정",
+    "prior_art_unlinked": "비슷한 기술 연결 해제",
     "ai_result_applied": "AI 결과 반영",
     "experiment_recorded": "실험 기록 추가",
+    "experiment_updated": "실험 기록 수정",
+    "experiment_deleted": "실험 기록 삭제",
     "derived_child_created": "파생 아이디어 생성",
     "derived_from_parent": "원래 아이디어에서 파생됨",
     "archived": "보관함으로 이동",
     "unarchived": "보관 해제",
+    "markdown_exported": "Markdown 내보내기",
 }
 
 

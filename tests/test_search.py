@@ -1,8 +1,11 @@
-"""FTS5 통합 검색 검증: 제목/원본메모/발명내용/태그/첨부파일명."""
+"""FTS5 통합 검색 검증: 제목/원본메모/발명내용/태그/첨부파일명/실험/AI결과/발명번호."""
 from __future__ import annotations
 
+from src.ai.results_service import AIResultService
 from src.attachments.service import AttachmentService
 from src.config.settings import Settings
+from src.experiments.schemas import ExperimentInput
+from src.experiments.service import ExperimentService
 from src.inventions.schemas import InventionInput, QuickIdeaInput
 from src.inventions.service import InventionService
 
@@ -106,3 +109,73 @@ def test_search_combined_with_status_filter(db_session):
 
     results = service.search(keyword="유리기판", status="검토 중")
     assert [r.id for r in results] == [inv.id]
+
+
+def test_search_matches_invention_no(db_session):
+    service = InventionService(db_session)
+    inv = service.quick_create(QuickIdeaInput(memo="발명번호 검색 테스트"))
+    suffix = inv.invention_no.split("-")[-1]
+
+    results = service.search(keyword=suffix)
+    assert inv.id in [r.id for r in results]
+
+
+def test_search_matches_experiment_records(db_session):
+    service = InventionService(db_session)
+    inv = service.quick_create(QuickIdeaInput(memo="실험 검색 테스트", title="고정 제목"))
+    ExperimentService(db_session).create(
+        inv.id, ExperimentInput(results="접합강도측정값이크게향상됨")
+    )
+
+    results = service.search(keyword="접합강도측정값이크게향상됨")
+    assert inv.id in [r.id for r in results]
+
+
+def test_search_index_updates_after_experiment_deleted(db_session):
+    service = InventionService(db_session)
+    inv = service.quick_create(QuickIdeaInput(memo="실험 삭제 검색 테스트", title="고정 제목2"))
+    exp = ExperimentService(db_session).create(
+        inv.id, ExperimentInput(results="유일무이한실험결과문구")
+    )
+    assert inv.id in [r.id for r in service.search(keyword="유일무이한실험결과문구")]
+
+    ExperimentService(db_session).delete(exp.id)
+    assert inv.id not in [r.id for r in service.search(keyword="유일무이한실험결과문구")]
+
+
+def test_search_matches_ai_result_content(db_session):
+    service = InventionService(db_session)
+    inv = service.quick_create(QuickIdeaInput(memo="AI 결과 검색 테스트", title="고정 제목3"))
+    AIResultService(db_session).create_draft(
+        inv.id, "summary", "그래핀히팅방식으로접합면을가열한다"
+    )
+
+    results = service.search(keyword="그래핀히팅방식으로접합면을가열한다")
+    assert inv.id in [r.id for r in results]
+
+
+def test_search_excludes_discarded_ai_result(db_session):
+    service = InventionService(db_session)
+    inv = service.quick_create(QuickIdeaInput(memo="AI 삭제 검색 테스트", title="고정 제목4"))
+    result_service = AIResultService(db_session)
+    draft = result_service.create_draft(inv.id, "summary", "삭제될고유한AI결과문구")
+    assert inv.id in [r.id for r in service.search(keyword="삭제될고유한AI결과문구")]
+
+    result_service.discard(draft.id)
+    assert inv.id not in [r.id for r in service.search(keyword="삭제될고유한AI결과문구")]
+
+
+def test_search_handles_special_characters_without_error(db_session):
+    service = InventionService(db_session)
+    service.quick_create(QuickIdeaInput(memo="특수문자 테스트"))
+    # 특수문자만 있는 검색어는 토큰이 전부 사라져 빈 결과를 반환해야 하고,
+    # 예외가 발생하면 안 된다.
+    assert service.search(keyword="!@#$%^&*()") == []
+
+
+def test_search_handles_empty_keyword(db_session):
+    service = InventionService(db_session)
+    service.quick_create(QuickIdeaInput(memo="빈 검색어 테스트"))
+    # 빈 검색어(또는 공백만)는 예외 없이 "필터 없음"과 같은 전체 목록을 반환해야 한다.
+    assert [r.id for r in service.search(keyword="")] == [r.id for r in service.search()]
+    assert [r.id for r in service.search(keyword="   ")] == [r.id for r in service.search()]
