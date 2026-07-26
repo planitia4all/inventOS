@@ -6,7 +6,9 @@ DB에는 경로와 원본 파일명만 기록한다. 종류(category)를 함께 
 """
 from __future__ import annotations
 
+import hashlib
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from sqlalchemy.orm import Session
@@ -36,6 +38,27 @@ _DEFAULT_CATEGORY_BY_EXTENSION: dict[str, str] = {
 
 class AttachmentError(Exception):
     pass
+
+
+@dataclass
+class AttachmentIntegrityReport:
+    """설정 화면 '첨부파일 무결성 검사'용 점검 결과.
+
+    실제로 삭제하는 동작은 없다 — 자동 삭제는 위험해서, 이 단계에서는
+    사용자에게 무엇이 문제인지 보여주기만 한다.
+    """
+
+    missing_files: list[dict] = field(default_factory=list)  # DB 행은 있는데 실제 파일이 없음
+    orphaned_files: list[str] = field(default_factory=list)  # 파일은 있는데 DB 행이 없음
+    zero_byte_files: list[dict] = field(default_factory=list)  # 파일은 있는데 크기가 0
+    duplicate_groups: list[list[dict]] = field(default_factory=list)  # 내용이 완전히 같은 파일들
+
+    @property
+    def is_healthy(self) -> bool:
+        return not (
+            self.missing_files or self.orphaned_files or self.zero_byte_files
+            or self.duplicate_groups
+        )
 
 
 def attachment_kind(filename: str) -> str:
@@ -166,10 +189,59 @@ class AttachmentService:
         if attachment is not None:
             self.delete(attachment)
 
+    def check_integrity(self) -> AttachmentIntegrityReport:
+        """DB 기록과 실제 파일이 서로 어긋난 곳이 있는지 점검한다.
+
+        파일 복사 성공 후 DB 저장 실패, DB 삭제 성공 후 파일 삭제 실패
+        같은 상황이 남긴 흔적(고아 파일/깨진 DB 행)을 찾아낸다. 찾기만
+        하고 지우지는 않는다 — 삭제는 사용자가 결과를 보고 직접 판단할 일이다.
+        """
+        report = AttachmentIntegrityReport()
+        attachments = list(self.session.query(Attachment).order_by(Attachment.uploaded_at))
+
+        referenced_paths: set[Path] = set()
+        hashes: dict[str, list[dict]] = {}
+
+        for attachment in attachments:
+            path = self.resolve_path(attachment)
+            info = {
+                "id": attachment.id,
+                "invention_id": attachment.invention_id,
+                "original_filename": attachment.original_filename,
+                "stored_path": attachment.stored_path,
+            }
+            if not path.exists():
+                report.missing_files.append(info)
+                continue
+
+            referenced_paths.add(path.resolve())
+            size = path.stat().st_size
+            if size == 0:
+                report.zero_byte_files.append(info)
+                continue
+
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            hashes.setdefault(digest, []).append(info)
+
+        for group in hashes.values():
+            if len(group) > 1:
+                report.duplicate_groups.append(group)
+
+        attachments_dir = self.settings.attachments_dir
+        if attachments_dir.exists():
+            for path in attachments_dir.rglob("*"):
+                if path.is_file() and path.resolve() not in referenced_paths:
+                    report.orphaned_files.append(
+                        str(path.relative_to(self.settings.data_dir))
+                    )
+
+        return report
+
 
 __all__ = [
     "ATTACHMENT_CATEGORIES",
     "AttachmentError",
+    "AttachmentIntegrityReport",
     "AttachmentService",
     "attachment_kind",
     "default_category",

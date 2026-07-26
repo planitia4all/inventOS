@@ -139,3 +139,67 @@ def test_copy_to_invention_creates_independent_file(db_session, tmp_path):
     assert service.resolve_path(copied).read_bytes() == b"original-bytes"
     # 원본 파일은 그대로 남아 있다 (복사이지 이동이 아니다).
     assert service.resolve_path(original).exists()
+
+
+def test_check_integrity_reports_healthy_when_all_consistent(db_session, tmp_path):
+    invention = make_invention(db_session)
+    service = make_service(db_session, tmp_path)
+    service.save(invention.id, "photo.png", b"unique-bytes-1")
+
+    report = service.check_integrity()
+
+    assert report.is_healthy
+    assert report.missing_files == []
+    assert report.orphaned_files == []
+
+
+def test_check_integrity_detects_missing_file(db_session, tmp_path):
+    invention = make_invention(db_session)
+    service = make_service(db_session, tmp_path)
+    attachment = service.save(invention.id, "photo.png", b"will-be-deleted")
+    service.resolve_path(attachment).unlink()  # DB 행은 남기고 실제 파일만 지운다
+
+    report = service.check_integrity()
+
+    assert not report.is_healthy
+    assert [m["id"] for m in report.missing_files] == [attachment.id]
+
+
+def test_check_integrity_detects_orphaned_file(db_session, tmp_path):
+    invention = make_invention(db_session)
+    service = make_service(db_session, tmp_path)
+    service.save(invention.id, "photo.png", b"tracked-bytes")
+
+    orphan_dir = service.settings.attachments_dir / invention.id
+    orphan_dir.mkdir(parents=True, exist_ok=True)
+    (orphan_dir / "untracked-file.png").write_bytes(b"nobody-points-to-me")
+
+    report = service.check_integrity()
+
+    assert not report.is_healthy
+    assert any("untracked-file.png" in path for path in report.orphaned_files)
+
+
+def test_check_integrity_detects_zero_byte_file(db_session, tmp_path):
+    invention = make_invention(db_session)
+    service = make_service(db_session, tmp_path)
+    attachment = service.save(invention.id, "photo.png", b"")
+
+    report = service.check_integrity()
+
+    assert not report.is_healthy
+    assert [z["id"] for z in report.zero_byte_files] == [attachment.id]
+
+
+def test_check_integrity_detects_duplicate_content(db_session, tmp_path):
+    invention = make_invention(db_session)
+    service = make_service(db_session, tmp_path)
+    first = service.save(invention.id, "photo1.png", b"same-bytes-twice")
+    second = service.save(invention.id, "photo2.png", b"same-bytes-twice")
+
+    report = service.check_integrity()
+
+    assert not report.is_healthy
+    assert len(report.duplicate_groups) == 1
+    group_ids = {item["id"] for item in report.duplicate_groups[0]}
+    assert group_ids == {first.id, second.id}

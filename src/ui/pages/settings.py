@@ -11,6 +11,7 @@ from datetime import datetime
 
 import streamlit as st
 
+from src.attachments.service import AttachmentService
 from src.config.settings import APP_VERSION, get_settings
 from src.database.backup import create_consistent_snapshot
 from src.database.engine import get_session
@@ -79,6 +80,9 @@ def render() -> None:
 
     st.divider()
     _render_search_index_section()
+
+    st.divider()
+    _render_attachment_integrity_section(settings)
 
     st.divider()
     st.subheader("앱 정보")
@@ -191,6 +195,49 @@ def _render_search_index_section() -> None:
                     f"고아 {len(report.orphaned_ids)}건, 오래됨 {len(report.stale_ids)}건 "
                     f"(총 {rebuilt}건 재색인)."
                 )
+
+
+def _render_attachment_integrity_section(settings) -> None:
+    st.subheader("첨부파일 무결성 검사")
+    st.caption(
+        "DB 기록과 실제 파일이 서로 어긋난 곳이 있는지 점검합니다(예: 파일은 "
+        "지웠는데 기록이 남아 있음, 반대로 기록 없는 파일이 남아 있음). 자동으로 "
+        "지우지는 않고 결과만 보여줍니다 — 지우는 것은 위험할 수 있어 신중한 "
+        "판단이 필요합니다."
+    )
+    if st.button("첨부파일 무결성 검사", key="check_attachment_integrity"):
+        with get_session() as session:
+            report = AttachmentService(session, settings=settings).check_integrity()
+        st.session_state["_attachment_integrity_report"] = report
+
+    report = st.session_state.get("_attachment_integrity_report")
+    if report is None:
+        return
+
+    if report.is_healthy:
+        st.success("첨부파일 상태가 정상입니다 — 어긋난 기록/파일이 없습니다.")
+        return
+
+    if report.missing_files:
+        st.warning(f"DB 기록은 있는데 실제 파일이 없는 항목: {len(report.missing_files)}건")
+        for item in report.missing_files:
+            st.caption(f"· {item['original_filename']} (invention_id={item['invention_id']})")
+
+    if report.orphaned_files:
+        st.warning(f"파일은 있는데 DB 기록이 없는 항목(고아 파일): {len(report.orphaned_files)}건")
+        for path in report.orphaned_files:
+            st.caption(f"· {path}")
+
+    if report.zero_byte_files:
+        st.warning(f"크기가 0byte인 파일: {len(report.zero_byte_files)}건")
+        for item in report.zero_byte_files:
+            st.caption(f"· {item['original_filename']} (invention_id={item['invention_id']})")
+
+    if report.duplicate_groups:
+        st.info(f"내용이 완전히 같은 파일 그룹: {len(report.duplicate_groups)}건")
+        for group in report.duplicate_groups:
+            names = ", ".join(item["original_filename"] for item in group)
+            st.caption(f"· {names}")
 
 
 def _build_markdown_zip(session) -> bytes:
