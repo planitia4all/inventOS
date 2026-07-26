@@ -12,12 +12,29 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 
 from sqlalchemy import Engine, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SearchIndexReport:
+    """검색 색인 점검 결과 (설정 화면 '검색 색인 검사 및 다시 만들기')."""
+
+    total_inventions: int = 0
+    indexed_count: int = 0
+    missing_ids: list[str] = field(default_factory=list)  # 발명은 있는데 색인이 없음
+    orphaned_ids: list[str] = field(default_factory=list)  # 색인은 있는데 발명이 없음(고아)
+    stale_ids: list[str] = field(default_factory=list)  # 색인된 제목이 현재와 다름(오래됨)
+
+    @property
+    def is_healthy(self) -> bool:
+        return not (self.missing_ids or self.orphaned_ids or self.stale_ids)
+
 
 FTS_TABLE = "invention_search_index"
 
@@ -37,7 +54,7 @@ _FTS_COLUMNS = [
 ]
 
 # Invention의 텍스트 본문 필드 (제목/원본과는 별도로 색인한다)
-_CONTENT_FIELDS = (
+CONTENT_FIELDS = (
     "technical_field",
     "refined_content",
     "problem_to_solve",
@@ -132,7 +149,7 @@ class SearchIndexService:
             return
 
         content_text = " ".join(
-            filter(None, (getattr(invention, f) for f in _CONTENT_FIELDS))
+            filter(None, (getattr(invention, f) for f in CONTENT_FIELDS))
         )
         tag_names = " ".join(
             name
@@ -207,6 +224,41 @@ class SearchIndexService:
             self.reindex_invention(invention.id)
             count += 1
         return count
+
+    def check_integrity(self) -> SearchIndexReport:
+        """색인이 비어 있지 않아도(발명 100개 중 95개만 색인됨 등) 부분
+        손상을 잡아낸다. 앱 시작 때마다 돌리기엔 무겁지만, 설정 화면에서
+        사용자가 필요할 때 눌러 점검+복구할 수 있게 한다."""
+        from src.database.models import Invention
+
+        invention_rows = {
+            inv_id: title for inv_id, title in self.session.query(Invention.id, Invention.title)
+        }
+        indexed_rows = {
+            row[0]: row[1]
+            for row in self.session.execute(
+                text(f"SELECT invention_id, title FROM {FTS_TABLE}")
+            )
+        }
+
+        invention_ids = set(invention_rows)
+        indexed_ids = set(indexed_rows)
+
+        missing = sorted(invention_ids - indexed_ids)
+        orphaned = sorted(indexed_ids - invention_ids)
+        stale = sorted(
+            inv_id
+            for inv_id in invention_ids & indexed_ids
+            if invention_rows[inv_id] != indexed_rows[inv_id]
+        )
+
+        return SearchIndexReport(
+            total_inventions=len(invention_ids),
+            indexed_count=len(indexed_ids),
+            missing_ids=missing,
+            orphaned_ids=orphaned,
+            stale_ids=stale,
+        )
 
     def search(self, query: str, limit: int = 50) -> list[str]:
         """검색어와 일치하는 발명 id를 관련도 순으로 반환한다.

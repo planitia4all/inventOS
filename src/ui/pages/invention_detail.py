@@ -15,7 +15,13 @@ import streamlit as st
 
 from src.ai.base import AIProviderError
 from src.ai.providers.factory import get_ai_provider
-from src.ai.results_service import RESULT_KINDS, AIResultService
+from src.ai.results_service import (
+    AlreadyAppliedError,
+    NoChangeToApplyError,
+    NoStructuredValueError,
+    RESULT_KINDS,
+    AIResultService,
+)
 from src.ai.review import (
     PARTIAL_APPLY_FIELD_LABELS,
     PARTIAL_APPLY_FIELDS,
@@ -259,9 +265,14 @@ def _render_ai_results(invention) -> None:
                 if r.status == "생성됨":
                     action_cols = st.columns(2)
                     if action_cols[0].button("전체 반영", key=f"apply_all_{r.id}"):
-                        run_and_rerun(
-                            lambda session, rid=r.id: AIResultService(session).apply(rid)
-                        )
+                        try:
+                            run_and_rerun(
+                                lambda session, rid=r.id: AIResultService(session).apply(rid)
+                            )
+                        except NoChangeToApplyError as exc:
+                            st.warning(str(exc))
+                        except AlreadyAppliedError as exc:
+                            st.warning(str(exc))
                     if action_cols[1].button("보관", key=f"archive_{r.id}"):
                         run_and_rerun(
                             lambda session, rid=r.id: AIResultService(session).archive(rid)
@@ -281,11 +292,18 @@ def _render_ai_results(invention) -> None:
                             if not chosen:
                                 st.warning("반영할 항목을 하나 이상 선택하세요.")
                             else:
-                                run_and_rerun(
-                                    lambda session, rid=r.id, fields=chosen: AIResultService(
-                                        session
-                                    ).apply(rid, target_fields=fields)
-                                )
+                                try:
+                                    run_and_rerun(
+                                        lambda session, rid=r.id, fields=chosen: AIResultService(
+                                            session
+                                        ).apply(rid, target_fields=fields)
+                                    )
+                                except NoStructuredValueError as exc:
+                                    st.error(str(exc))
+                                except NoChangeToApplyError as exc:
+                                    st.warning(str(exc))
+                                except AlreadyAppliedError as exc:
+                                    st.warning(str(exc))
 
                     redo_cols = st.columns(2)
                     if redo_cols[0].button("다시 생성", key=f"redo_{r.id}"):
@@ -299,6 +317,27 @@ def _render_ai_results(invention) -> None:
                         PARTIAL_APPLY_FIELD_LABELS.get(f, f) for f in r.applied_fields
                     )
                     st.caption(f"반영된 항목: {applied_labels}")
+
+                if r.status == "반영됨":
+                    with st.expander("다시 반영", expanded=False):
+                        st.caption(
+                            "이미 반영된 결과입니다. 같은 내용이 이미 있으면 다시 반영해도 "
+                            "중복으로 추가되지 않지만, 실수로 또 반영하지 않도록 확인이 필요합니다."
+                        )
+                        confirm = st.checkbox(
+                            "다시 반영할 것을 확인합니다", key=f"confirm_reapply_{r.id}"
+                        )
+                        if st.button(
+                            "다시 반영", key=f"reapply_{r.id}", disabled=not confirm
+                        ):
+                            try:
+                                run_and_rerun(
+                                    lambda session, rid=r.id: AIResultService(session).apply(
+                                        rid, allow_reapply=True
+                                    )
+                                )
+                            except NoChangeToApplyError as exc:
+                                st.warning(str(exc))
 
 
 def _render_related_ideas(invention) -> None:

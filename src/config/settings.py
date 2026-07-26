@@ -2,14 +2,20 @@
 
 API 키와 사용자 설정은 .env 파일 또는 OS 환경변수에서만 읽는다.
 데이터베이스에 평문으로 저장하지 않는다.
+
+환경변수가 잘못 입력되어도(숫자 자리에 문자열 등) 앱 시작 자체가
+traceback과 함께 죽으면 안 된다 — 안전한 기본값으로 대체하고 로그만 남긴다.
 """
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -19,6 +25,12 @@ load_dotenv(_PROJECT_ROOT / ".env")
 # 업데이트 체크 등에는 쓰지 않는다.
 APP_VERSION = "0.4.0"
 
+# 현재 코드가 실제로 만들 수 있는 AI Provider. "openai"는 .env/설정 화면에
+# 자리는 마련해 두었지만 아직 구현하지 않았다 — src/ai/providers/factory.py가
+# 이 목록 밖의 값이면 이유를 밝히고 Mock으로 대체한다.
+SUPPORTED_AI_PROVIDERS = ("mock", "anthropic")
+PLANNED_AI_PROVIDERS = ("openai",)  # 설정은 받아두지만 아직 미구현
+
 
 def _mask(value: str | None) -> str:
     """UI/로그 표시용으로 키를 마스킹한다."""
@@ -27,6 +39,22 @@ def _mask(value: str | None) -> str:
     if len(value) <= 4:
         return "*" * len(value)
     return value[:2] + "*" * (len(value) - 4) + value[-2:]
+
+
+def _safe_int(env_var: str, default: int) -> int:
+    raw = os.getenv(env_var)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(
+            "환경변수 %s 값 '%s'을(를) 숫자로 읽을 수 없어 기본값 %d을 사용합니다.",
+            env_var,
+            raw,
+            default,
+        )
+        return default
 
 
 @dataclass
@@ -39,7 +67,7 @@ class Settings:
     )
     language: str = field(default_factory=lambda: os.getenv("INVENTOS_LANGUAGE", "ko"))
     default_search_limit: int = field(
-        default_factory=lambda: int(os.getenv("INVENTOS_DEFAULT_SEARCH_LIMIT", "20"))
+        default_factory=lambda: _safe_int("INVENTOS_DEFAULT_SEARCH_LIMIT", 20)
     )
 
     kipris_api_key: str = field(default_factory=lambda: os.getenv("KIPRIS_API_KEY", ""))

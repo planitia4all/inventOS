@@ -25,6 +25,10 @@ from sqlalchemy.orm import Session, sessionmaker
 
 logger = logging.getLogger(__name__)
 
+
+class MigrationBackupError(RuntimeError):
+    """스키마 변경이 필요한 기존 DB의 백업이 실패해 마이그레이션을 중단했을 때."""
+
 # 테이블별로 나중에 추가된 컬럼과 SQLite 타입 정의
 _ADDED_COLUMNS: dict[str, dict[str, str]] = {
     "inventions": {
@@ -85,29 +89,48 @@ def _needs_column_migration(engine: Engine) -> bool:
     return False
 
 
+def _unique_backup_path(db_path: Path) -> Path:
+    """초 단위 타임스탬프가 같은 순간에 두 번 백업해도 서로 덮어쓰지 않도록,
+    이미 있는 파일이면 `_01`, `_02`... 순번을 붙여 고유한 경로를 만든다."""
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    candidate = db_path.with_name(f"{db_path.stem}_backup_{timestamp}{db_path.suffix}")
+    suffix_no = 1
+    while candidate.exists():
+        candidate = db_path.with_name(
+            f"{db_path.stem}_backup_{timestamp}_{suffix_no:02d}{db_path.suffix}"
+        )
+        suffix_no += 1
+    return candidate
+
+
 def _backup_db_file(engine: Engine) -> Path | None:
     """스키마를 바꾸기 전에 SQLite 파일을 통째로 복사해 둔다.
 
     새 DB(파일이 아직 없거나 비어 있음)나 in-memory DB에서는 아무 일도
-    하지 않는다 — 백업할 기존 데이터가 없기 때문이다. 백업 자체가
-    실패해도(디스크 꽉 참 등) 마이그레이션을 막지는 않는다 — 로그만 남긴다.
-    """
-    try:
-        url = engine.url
-        if url.get_backend_name() != "sqlite" or not url.database:
-            return None
-        db_path = Path(url.database)
-        if db_path.name == ":memory:" or not db_path.exists() or db_path.stat().st_size == 0:
-            return None
+    하지 않는다 — 백업할 기존 데이터가 없기 때문이다.
 
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        backup_path = db_path.with_name(f"{db_path.stem}_backup_{timestamp}{db_path.suffix}")
-        shutil.copy2(db_path, backup_path)
-        logger.info("스키마 변경 전 DB를 백업했습니다: %s", backup_path)
-        return backup_path
-    except OSError as exc:
-        logger.warning("Migration 전 DB 백업에 실패했습니다 (계속 진행합니다): %s", exc)
+    이미 데이터가 있는 기존 DB인데 백업 자체가 실패하면(디스크 꽉 참,
+    쓰기 권한 없음 등) 안전망 없이 스키마를 바꾸지 않는다 —
+    `MigrationBackupError`를 던져 마이그레이션 전체를 중단시킨다. 사용자가
+    원인을 해결하고 다시 실행하면 된다.
+    """
+    url = engine.url
+    if url.get_backend_name() != "sqlite" or not url.database:
         return None
+    db_path = Path(url.database)
+    if db_path.name == ":memory:" or not db_path.exists() or db_path.stat().st_size == 0:
+        return None
+
+    backup_path = _unique_backup_path(db_path)
+    try:
+        shutil.copy2(db_path, backup_path)
+    except OSError as exc:
+        raise MigrationBackupError(
+            "스키마 변경 전 데이터베이스 백업에 실패해 마이그레이션을 중단했습니다. "
+            f"디스크 공간이나 쓰기 권한을 확인한 뒤 다시 실행해 주세요. (원인: {exc})"
+        ) from exc
+    logger.info("스키마 변경 전 DB를 백업했습니다: %s", backup_path)
+    return backup_path
 
 
 def _add_missing_columns(engine: Engine) -> list[str]:

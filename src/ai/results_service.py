@@ -8,6 +8,15 @@
 같은 검토를 여러 번 실행해도 이전 결과를 덮어쓰지 않는다 — 매번 새
 레코드를 만들어서 사용자가 여러 결과를 비교할 수 있게 한다.
 
+반영에는 두 가지 뚜렷이 다른 동작이 있다(둘을 섞지 않는다):
+- 전체 반영(target_fields 없이 호출): AI 원문(content) 전체를 하나의
+  발명 필드에 그대로 채운다.
+- 일부만 반영(target_fields로 호출): 사용자가 고른 항목마다 구조화된
+  응답에서 그 항목에 정확히 대응하는 값만 꺼내 반영한다. 그 항목에
+  대응하는 구조화된 값이 없으면(Mock이거나 파싱 실패) 조용히 원문
+  전체로 대체하지 않고, 반영하지 않은 채 사용자에게 알린다 — 무관한
+  내용이 섞여 들어가는 걸 막기 위해서다.
+
 특허 비교 초안(PatentService.save_ai_comparison_draft/apply_ai_comparison_draft)과
 같은 '초안 → 검토 → 적용' 패턴을, 발명 본문 차원으로 일반화한 것이다.
 """
@@ -39,6 +48,18 @@ STATUS_CREATED = "생성됨"
 STATUS_APPLIED = "반영됨"
 STATUS_ARCHIVED = "보관됨"
 STATUS_DELETED = "삭제됨"
+
+
+class NoStructuredValueError(ValueError):
+    """'일부만 반영'에서 선택한 항목 전부에 구조화된 값이 없을 때."""
+
+
+class AlreadyAppliedError(Exception):
+    """이미 반영된 AI 결과를 확인(allow_reapply) 없이 다시 반영하려 할 때."""
+
+
+class NoChangeToApplyError(Exception):
+    """반영할 값이 이미 발명 내용에 그대로 들어있어 새로 바뀔 것이 없을 때."""
 
 
 class AIResultService:
@@ -100,12 +121,21 @@ class AIResultService:
         result_id: str,
         target_field: str | None = None,
         target_fields: list[str] | None = None,
+        allow_reapply: bool = False,
     ) -> InventionAIResult:
         """사용자가 검토 후 반영을 눌렀을 때만 발명 필드에 내용을 복사한다.
 
-        `target_fields`를 넘기면 그 필드 전부에 같은 내용을 채운다("일부만
-        반영" — 항목 단위 선택). 아무것도 넘기지 않으면 kind별 기본 필드
-        하나에 채운다("전체 반영").
+        `target_fields`(복수)를 넘기면 "일부만 반영" 모드다 — 각 항목에
+        대응하는 구조화된 값만 정확히 반영하고, 값이 없는 항목은 반영하지
+        않은 채 `NoStructuredValueError`로 알린다(원문 전체로 조용히
+        대체하지 않는다). `target_fields`를 넘기지 않으면 "전체 반영"
+        모드로, AI 원문 전체를 kind별 기본 필드(또는 `target_field`로
+        지정한 필드) 하나에 채운다.
+
+        이미 반영된 결과는 `allow_reapply=True`를 명시하지 않으면
+        `AlreadyAppliedError`를 던진다. 반영하려는 값이 이미 그 필드
+        안에 그대로 있으면(중복) `NoChangeToApplyError`를 던지고 아무
+        것도 바꾸지 않는다 — Revision/Timeline도 새로 만들지 않는다.
 
         반영 전에는 항상 현재 내용을 InventionRevision으로 스냅샷하고,
         반영에 성공한 뒤에만 Timeline에 기록한다 — 실패하면(예: 발명을
@@ -115,12 +145,33 @@ class AIResultService:
         if result is None:
             raise LookupError(f"AI 결과를 찾을 수 없습니다: {result_id}")
 
-        if target_fields:
+        if result.status == STATUS_APPLIED and not allow_reapply:
+            applied_at = result.applied_at.strftime("%Y-%m-%d %H:%M") if result.applied_at else "?"
+            raise AlreadyAppliedError(
+                f"이 결과는 이미 {applied_at}에 반영되었습니다. 다시 반영하려면 확인이 필요합니다."
+            )
+
+        partial_mode = target_fields is not None
+        if partial_mode:
             fields = list(dict.fromkeys(target_fields))
-        elif target_field:
-            fields = [target_field]
+            values: dict[str, str] = {}
+            empty_fields: list[str] = []
+            for field in fields:
+                value = apply_structured_value(result.structured_content, field)
+                if value:
+                    values[field] = value
+                else:
+                    empty_fields.append(field)
+            if not values:
+                labels = ", ".join(PARTIAL_APPLY_FIELD_LABELS.get(f, f) for f in empty_fields)
+                raise NoStructuredValueError(
+                    f"선택한 항목에 반영할 구조화된 값이 없습니다: {labels}. "
+                    "AI 원문 전체를 반영하려면 '전체 반영'을 사용하세요."
+                )
         else:
-            fields = [_DEFAULT_TARGET_FIELD.get(result.kind, "review_notes")]
+            field = target_field or _DEFAULT_TARGET_FIELD.get(result.kind, "review_notes")
+            values = {field: result.content}
+            empty_fields = []
 
         # 순환 import를 피하려고 지연 import한다. update_fields()를 거치지
         # 않고 필드를 직접 바꾸는 이유: update_fields는 일반적인
@@ -133,35 +184,47 @@ class AIResultService:
         if invention is None:
             raise LookupError(f"발명을 찾을 수 없습니다: {result.invention_id}")
 
+        # 실제로 바뀔 필드만 추린다 — 반영하려는 값이 이미 그 필드 안에
+        # 그대로 있으면 건드리지 않는다(중복 반영 방지). 아무것도 안
+        # 바뀌면 Revision/Timeline도 만들지 않는다.
+        changes: dict[str, str] = {}
+        for field, value in values.items():
+            existing = getattr(invention, field) or ""
+            if value in existing:
+                continue
+            changes[field] = f"{existing}\n\n{value}".strip() if existing else value
+
+        if not changes:
+            raise NoChangeToApplyError("반영하려는 내용이 이미 발명 내용에 있어 바뀔 것이 없습니다.")
+
         InventionService(self.session).save_revision(
-            invention.id, change_note=f"AI 검토 결과 반영 전 자동 저장 ({RESULT_KINDS.get(result.kind, result.kind)})"
+            invention.id,
+            change_note=f"AI 검토 결과 반영 전 자동 저장 ({RESULT_KINDS.get(result.kind, result.kind)})",
         )
 
-        for field in fields:
-            # 구조화된 응답에서 이 필드에 해당하는 값이 있으면 그 값만
-            # 정확히 반영한다("일부만 반영"의 정확도). 구조화 데이터가
-            # 없거나(예: Mock/파싱 실패) 이 필드에 대응하는 값이 비어
-            # 있으면 결과 전체 텍스트로 대체한다 — 항상 뭔가는 반영된다.
-            value = apply_structured_value(result.structured_content, field) or result.content
-            existing = getattr(invention, field) or ""
-            merged = f"{existing}\n\n{value}".strip() if existing else value
+        for field, merged in changes.items():
             setattr(invention, field, merged)
         self.session.flush()
 
+        applied_fields = list(changes)
         result.applied_at = datetime.utcnow()
-        result.applied_to_field = fields[0]
-        result.applied_fields = fields
+        result.applied_to_field = applied_fields[0]
+        result.applied_fields = applied_fields
         result.status = STATUS_APPLIED
         self.session.flush()
 
-        field_labels = ", ".join(PARTIAL_APPLY_FIELD_LABELS.get(f, f) for f in fields)
+        field_labels = ", ".join(PARTIAL_APPLY_FIELD_LABELS.get(f, f) for f in applied_fields)
         TimelineService(self.session).log(
             result.invention_id,
             "ai_result_applied",
             description=f"{RESULT_KINDS.get(result.kind, result.kind)} → {field_labels}",
-            meta={"kind": result.kind, "applied_fields": fields},
+            meta={"kind": result.kind, "applied_fields": applied_fields},
         )
         SearchIndexService(self.session).reindex_invention(result.invention_id)
+
+        # UI가 "일부 항목은 구조화된 값이 없어 건너뛰었다"는 걸 안내할 수
+        # 있도록 임시 속성에 담아 둔다(DB에 저장되는 컬럼이 아니다).
+        result.skipped_fields = empty_fields
         return result
 
     def archive(self, result_id: str) -> InventionAIResult | None:

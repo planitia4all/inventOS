@@ -6,7 +6,12 @@ from __future__ import annotations
 
 import pytest
 
-from src.ai.results_service import AIResultService
+from src.ai.results_service import (
+    AIResultService,
+    AlreadyAppliedError,
+    NoChangeToApplyError,
+    NoStructuredValueError,
+)
 from src.inventions.schemas import QuickIdeaInput
 from src.inventions.service import InventionService
 
@@ -134,19 +139,32 @@ def test_create_draft_stores_model_and_input_snapshot(db_session):
 def test_apply_with_target_fields_writes_all_selected_fields(db_session):
     invention = make_invention(db_session)
     service = AIResultService(db_session)
-    draft = service.create_draft(invention.id, "summary", "여러 필드에 반영될 내용")
+    draft = service.create_draft(
+        invention.id,
+        "summary",
+        "렌더링된 전체 텍스트",
+        structured_content={
+            "problem": "문제 필드 값",
+            "core_idea": "핵심아이디어 필드 값",
+        },
+    )
 
     service.apply(draft.id, target_fields=["problem_to_solve", "core_principle"])
 
     refreshed = InventionService(db_session).get(invention.id)
-    assert refreshed.problem_to_solve == "여러 필드에 반영될 내용"
-    assert refreshed.core_principle == "여러 필드에 반영될 내용"
+    assert refreshed.problem_to_solve == "문제 필드 값"
+    assert refreshed.core_principle == "핵심아이디어 필드 값"
 
 
 def test_apply_records_applied_fields_list(db_session):
     invention = make_invention(db_session)
     service = AIResultService(db_session)
-    draft = service.create_draft(invention.id, "summary", "내용")
+    draft = service.create_draft(
+        invention.id,
+        "summary",
+        "내용",
+        structured_content={"problem": "문제값", "differentiation": "차별점값"},
+    )
 
     applied = service.apply(draft.id, target_fields=["problem_to_solve", "differentiation"])
 
@@ -172,7 +190,9 @@ def test_apply_creates_revision_before_applying(db_session):
 def test_apply_timeline_mentions_kind_and_fields(db_session):
     invention = make_invention(db_session)
     service = AIResultService(db_session)
-    draft = service.create_draft(invention.id, "summary", "내용")
+    draft = service.create_draft(
+        invention.id, "summary", "내용", structured_content={"problem": "문제값"}
+    )
     service.apply(draft.id, target_fields=["problem_to_solve"])
 
     events = InventionService(db_session).list_timeline(invention.id)
@@ -256,30 +276,125 @@ def test_apply_uses_structured_value_for_matching_field(db_session):
     assert refreshed.core_principle == "정확한 핵심 아이디어"
 
 
-def test_apply_falls_back_to_full_content_when_structured_field_empty(db_session):
+def test_apply_partial_does_not_fall_back_to_full_content_when_field_empty(db_session):
+    """'일부만 반영'은 구조화된 값이 없으면 원문 전체로 조용히 대체하지
+    않는다 — 무관한 내용이 섞여 들어가는 걸 막기 위해서다."""
     invention = make_invention(db_session)
     service = AIResultService(db_session)
     draft = service.create_draft(
         invention.id,
         "summary",
-        "전체 내용으로 대체됨",
+        "전체 내용(반영되면 안 됨)",
         structured_content={"problem": ""},  # 이 필드는 비어 있음
     )
 
-    service.apply(draft.id, target_fields=["problem_to_solve"])
+    with pytest.raises(NoStructuredValueError):
+        service.apply(draft.id, target_fields=["problem_to_solve"])
 
     refreshed = InventionService(db_session).get(invention.id)
-    assert refreshed.problem_to_solve == "전체 내용으로 대체됨"
+    assert not (refreshed.problem_to_solve or "").strip()
 
 
-def test_apply_without_structured_content_uses_full_content(db_session):
-    """Mock/파싱 실패 등으로 structured_content가 없어도 기존처럼 동작해야 한다."""
+def test_apply_partial_without_structured_content_raises(db_session):
+    """구조화 데이터 자체가 없는 결과(Mock 등)에 '일부만 반영'을 쓰면
+    반영할 값이 없다는 것을 명확히 알려야 한다."""
     invention = make_invention(db_session)
     service = AIResultService(db_session)
     draft = service.create_draft(invention.id, "summary", "구조화 없는 결과")
 
-    service.apply(draft.id, target_fields=["problem_to_solve", "core_principle"])
+    with pytest.raises(NoStructuredValueError):
+        service.apply(draft.id, target_fields=["problem_to_solve", "core_principle"])
 
     refreshed = InventionService(db_session).get(invention.id)
-    assert refreshed.problem_to_solve == "구조화 없는 결과"
-    assert refreshed.core_principle == "구조화 없는 결과"
+    assert not (refreshed.problem_to_solve or "").strip()
+    assert not (refreshed.core_principle or "").strip()
+
+
+def test_apply_partial_applies_only_fields_with_values_and_reports_skipped(db_session):
+    invention = make_invention(db_session)
+    service = AIResultService(db_session)
+    draft = service.create_draft(
+        invention.id,
+        "summary",
+        "전체 내용",
+        structured_content={"problem": "문제값", "core_idea": ""},
+    )
+
+    applied = service.apply(
+        draft.id, target_fields=["problem_to_solve", "core_principle"]
+    )
+
+    refreshed = InventionService(db_session).get(invention.id)
+    assert refreshed.problem_to_solve == "문제값"
+    assert not (refreshed.core_principle or "").strip()
+    assert applied.applied_fields == ["problem_to_solve"]
+    assert applied.skipped_fields == ["core_principle"]
+
+
+def test_apply_full_content_mode_always_uses_raw_content(db_session):
+    """'전체 반영'(target_fields 없이 호출)은 구조화 데이터 유무와 관계없이
+    항상 AI 원문 전체를 사용한다 — 이건 의도된 동작이다."""
+    invention = make_invention(db_session)
+    service = AIResultService(db_session)
+    draft = service.create_draft(
+        invention.id,
+        "summary",
+        "AI 원문 전체",
+        structured_content={"problem": "다른 값"},
+    )
+
+    service.apply(draft.id, target_field="problem_to_solve")
+
+    refreshed = InventionService(db_session).get(invention.id)
+    assert refreshed.problem_to_solve == "AI 원문 전체"
+
+
+def test_reapplying_already_applied_result_raises_without_confirmation(db_session):
+    invention = make_invention(db_session)
+    service = AIResultService(db_session)
+    draft = service.create_draft(invention.id, "summary", "내용")
+    service.apply(draft.id)
+
+    with pytest.raises(AlreadyAppliedError):
+        service.apply(draft.id)
+
+
+def test_reapplying_with_allow_reapply_succeeds(db_session):
+    invention = make_invention(db_session)
+    service = AIResultService(db_session)
+    draft = service.create_draft(invention.id, "summary", "정리된초안텍스트")
+    service.apply(draft.id)
+    InventionService(db_session).update_fields(invention.id, refined_content="완전히 다른 문구로 대체됨")
+
+    # 다시 반영하면 명시적으로 허용했으므로 성공하고, 값이 다시 붙는다.
+    service.apply(draft.id, allow_reapply=True)
+    refreshed = InventionService(db_session).get(invention.id)
+    assert "정리된초안텍스트" in refreshed.refined_content
+
+
+def test_reapplying_identical_content_raises_no_change(db_session):
+    """이미 반영된 것과 완전히 같은 내용을 다시 반영하려 하면 중복
+    추가하지 않고 알려준다."""
+    invention = make_invention(db_session)
+    service = AIResultService(db_session)
+    draft = service.create_draft(invention.id, "summary", "똑같은 내용")
+    service.apply(draft.id)
+
+    with pytest.raises(NoChangeToApplyError):
+        service.apply(draft.id, allow_reapply=True)
+
+
+def test_no_change_to_apply_does_not_create_revision_or_timeline(db_session):
+    invention = make_invention(db_session)
+    service = AIResultService(db_session)
+    draft = service.create_draft(invention.id, "summary", "똑같은 내용")
+    service.apply(draft.id)
+
+    revisions_before = len(InventionService(db_session).list_revisions(invention.id))
+    events_before = len(InventionService(db_session).list_timeline(invention.id))
+
+    with pytest.raises(NoChangeToApplyError):
+        service.apply(draft.id, allow_reapply=True)
+
+    assert len(InventionService(db_session).list_revisions(invention.id)) == revisions_before
+    assert len(InventionService(db_session).list_timeline(invention.id)) == events_before

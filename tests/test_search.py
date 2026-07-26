@@ -179,3 +179,90 @@ def test_search_handles_empty_keyword(db_session):
     # 빈 검색어(또는 공백만)는 예외 없이 "필터 없음"과 같은 전체 목록을 반환해야 한다.
     assert [r.id for r in service.search(keyword="")] == [r.id for r in service.search()]
     assert [r.id for r in service.search(keyword="   ")] == [r.id for r in service.search()]
+
+
+def test_check_integrity_reports_healthy_index(db_session):
+    from src.search.fts import SearchIndexService
+
+    service = InventionService(db_session)
+    service.quick_create(QuickIdeaInput(memo="정상 색인 테스트"))
+
+    report = SearchIndexService(db_session).check_integrity()
+    assert report.is_healthy
+    assert report.total_inventions == 1
+    assert report.indexed_count == 1
+
+
+def test_check_integrity_detects_missing_index(db_session):
+    from sqlalchemy import text
+
+    from src.search.fts import FTS_TABLE, SearchIndexService
+
+    service = InventionService(db_session)
+    inv = service.quick_create(QuickIdeaInput(memo="색인 누락 테스트"))
+    db_session.execute(
+        text(f"DELETE FROM {FTS_TABLE} WHERE invention_id = :id"), {"id": inv.id}
+    )
+
+    report = SearchIndexService(db_session).check_integrity()
+    assert not report.is_healthy
+    assert inv.id in report.missing_ids
+
+
+def test_check_integrity_detects_orphaned_index(db_session):
+    from sqlalchemy import text
+
+    from src.search.fts import FTS_TABLE, SearchIndexService
+
+    service = InventionService(db_session)
+    inv = service.quick_create(QuickIdeaInput(memo="고아 색인 테스트"))
+    service.delete(inv.id)
+    # delete()가 정상적으로 색인도 지우므로, 고아 상태를 인위적으로 재현한다.
+    db_session.execute(
+        text(
+            f"INSERT INTO {FTS_TABLE} (invention_id, invention_no, title, original_idea, "
+            "content_text, tags, attachment_names, experiment_text, ai_results_text) "
+            "VALUES (:id, 'INV-2026-99999', '삭제된 발명', '본문', '', '', '', '', '')"
+        ),
+        {"id": inv.id},
+    )
+
+    report = SearchIndexService(db_session).check_integrity()
+    assert not report.is_healthy
+    assert inv.id in report.orphaned_ids
+
+
+def test_check_integrity_detects_stale_title(db_session):
+    from sqlalchemy import text
+
+    from src.search.fts import FTS_TABLE, SearchIndexService
+
+    service = InventionService(db_session)
+    inv = service.quick_create(QuickIdeaInput(memo="오래된 색인 테스트", title="고정 제목"))
+    db_session.execute(
+        text(f"UPDATE {FTS_TABLE} SET title = '옛날 제목' WHERE invention_id = :id"),
+        {"id": inv.id},
+    )
+
+    report = SearchIndexService(db_session).check_integrity()
+    assert not report.is_healthy
+    assert inv.id in report.stale_ids
+
+
+def test_rebuild_all_fixes_reported_problems(db_session):
+    from sqlalchemy import text
+
+    from src.search.fts import FTS_TABLE, SearchIndexService
+
+    service = InventionService(db_session)
+    inv = service.quick_create(QuickIdeaInput(memo="복구 테스트"))
+    db_session.execute(
+        text(f"DELETE FROM {FTS_TABLE} WHERE invention_id = :id"), {"id": inv.id}
+    )
+
+    index_service = SearchIndexService(db_session)
+    assert not index_service.check_integrity().is_healthy
+
+    index_service.rebuild_all()
+
+    assert index_service.check_integrity().is_healthy

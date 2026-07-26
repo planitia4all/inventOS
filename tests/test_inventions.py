@@ -72,6 +72,51 @@ def test_duplicate_invention_no_rejected_at_db_level(db_session):
     db_session.rollback()
 
 
+def test_create_retries_when_invention_no_collides(db_session, monkeypatch):
+    """동시 생성 경합으로 next_invention_no()가 이미 쓰인 번호를 계산해도
+    (더블클릭, 여러 탭 등) 자동으로 다시 계산해 재시도해야 한다 — 사용자에게
+    원문 IntegrityError가 보이면 안 된다."""
+    from src.inventions.repository import InventionRepository
+
+    service = InventionService(db_session)
+    existing = service.create(make_input())
+    db_session.commit()  # 실제로는 별도의(이미 커밋된) 세션에서 만들어진 발명이다
+
+    calls = {"count": 0}
+
+    def flaky_next(self, year):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return existing.invention_no  # 일부러 충돌시킨다
+        return "INV-2026-09999"
+
+    monkeypatch.setattr(InventionRepository, "next_invention_no", flaky_next)
+
+    second = service.create(make_input(title="충돌 후 생성"))
+
+    assert second.invention_no != existing.invention_no
+    assert calls["count"] == 2
+
+
+def test_create_raises_clear_error_after_exhausting_retries(db_session, monkeypatch):
+    """계속 충돌하면(비정상 상황) 원문 IntegrityError 대신 이해할 수 있는
+    예외를 던져야 한다."""
+    from src.inventions.repository import InventionRepository
+
+    service = InventionService(db_session)
+    existing = service.create(make_input())
+    db_session.commit()
+
+    monkeypatch.setattr(
+        InventionRepository,
+        "next_invention_no",
+        lambda self, year: existing.invention_no,
+    )
+
+    with pytest.raises(RuntimeError, match="발명번호"):
+        service.create(make_input(title="계속 충돌"))
+
+
 def test_update_invention(db_session):
     service = InventionService(db_session)
     invention = service.create(make_input())

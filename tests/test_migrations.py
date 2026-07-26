@@ -5,9 +5,10 @@
 """
 from __future__ import annotations
 
+import pytest
 from sqlalchemy import create_engine, inspect, text
 
-from src.database.migrations import run_migrations
+from src.database.migrations import MigrationBackupError, run_migrations
 
 # Sprint 1 시절의 옛 스키마 (새 컬럼이 없는 상태)
 _OLD_SCHEMA = """
@@ -291,3 +292,39 @@ def test_migration_backup_is_only_created_once_across_repeated_runs(tmp_path):
 
     backups = list(tmp_path.glob("old_backup_*.db"))
     assert len(backups) == 1
+
+
+def test_migration_aborts_when_backup_fails_on_existing_db(tmp_path, monkeypatch):
+    """기존 데이터가 있는 DB인데 백업이 실패하면(디스크 꽉 참 등), 안전망 없이
+    스키마를 바꾸지 않고 마이그레이션 자체를 중단해야 한다."""
+    import shutil
+
+    engine = _old_db(tmp_path)
+
+    def failing_copy(*args, **kwargs):
+        raise OSError("디스크 공간 부족(시뮬레이션)")
+
+    monkeypatch.setattr(shutil, "copy2", failing_copy)
+
+    with pytest.raises(MigrationBackupError):
+        run_migrations(engine)
+
+    # 백업이 실패했으니 스키마도 바뀌지 않아야 한다 (컬럼이 추가되지 않음).
+    inspector = inspect(engine)
+    present = {col["name"] for col in inspector.get_columns("inventions")}
+    assert "refined_content" not in present
+
+
+def test_migration_backup_filenames_do_not_collide_within_same_second(tmp_path, monkeypatch):
+    """같은 초 안에 두 번 백업해도 파일명이 겹쳐 서로 덮어쓰지 않아야 한다."""
+    from src.database.migrations import _unique_backup_path
+
+    db_path = tmp_path / "old.db"
+    db_path.write_bytes(b"fake")
+
+    first = _unique_backup_path(db_path)
+    first.write_bytes(b"backup-1")
+    second = _unique_backup_path(db_path)
+
+    assert first != second
+    assert not second.exists()

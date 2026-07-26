@@ -12,6 +12,7 @@ import logging
 import re
 from datetime import datetime, timezone
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.database.models import Invention, InventionRevision
@@ -24,6 +25,7 @@ from src.timeline.service import TimelineService
 logger = logging.getLogger(__name__)
 
 _TITLE_MAX_LEN = 40
+_INVENTION_NO_RETRY_LIMIT = 3
 
 # invention_to_dict / update 에서 함께 다루는 본문 필드
 _CONTENT_FIELDS = (
@@ -231,14 +233,32 @@ class InventionService:
         title: str = "",
         status: str = DEFAULT_STATUS,
     ) -> Invention:
+        """발명번호를 계산해 새 Invention을 만든다.
+
+        `next_invention_no()`는 잠금 없이 max+1을 계산하므로, 더블클릭이나
+        여러 탭/세션에서 동시에 저장하면 같은 번호를 계산할 수 있다.
+        `invention_no`의 UNIQUE 제약이 실제 중복 저장은 막아 주지만, 그대로
+        두면 사용자에게 원문 IntegrityError가 노출된다 — 여기서 감지해
+        번호를 다시 계산해 재시도한다(최대 3회).
+        """
         year = datetime.now(timezone.utc).year
-        invention = Invention(
-            invention_no=self.repo.next_invention_no(year),
-            title=(title or "").strip() or generate_title(original_idea),
-            original_idea=original_idea,
-            status=status,
-        )
-        return self.repo.add(invention)
+        last_error: IntegrityError | None = None
+        for _ in range(_INVENTION_NO_RETRY_LIMIT):
+            invention = Invention(
+                invention_no=self.repo.next_invention_no(year),
+                title=(title or "").strip() or generate_title(original_idea),
+                original_idea=original_idea,
+                status=status,
+            )
+            try:
+                return self.repo.add(invention)
+            except IntegrityError as exc:
+                self.session.rollback()
+                last_error = exc
+                logger.warning("발명번호 충돌을 감지해 다시 계산합니다: %s", exc)
+        raise RuntimeError(
+            "발명번호를 생성하지 못했습니다. 잠시 후 다시 시도해 주세요."
+        ) from last_error
 
     # ------------------------------------------------------------------
     # 수정
