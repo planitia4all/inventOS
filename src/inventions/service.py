@@ -1,6 +1,10 @@
 """발명 비즈니스 로직.
 
 UI는 이 계층만 호출하고, ORM/DB 세부사항을 직접 다루지 않는다.
+
+핵심 관점: 발명은 정적 문서가 아니라 시간에 따라 발전하는 객체다. 그래서
+이 서비스는 내용을 바꿀 때마다 (1) 원본 보존이 필요하면 InventionRevision
+스냅샷을 남기고, (2) 무슨 일이 있었는지 TimelineService로 기록한다.
 """
 from __future__ import annotations
 
@@ -11,7 +15,10 @@ from sqlalchemy.orm import Session
 
 from src.database.models import Invention, InventionRevision
 from src.inventions.repository import InventionRepository
-from src.inventions.schemas import InventionInput, QuickIdeaInput
+from src.inventions.schemas import DEFAULT_STATUS, InventionInput, QuickIdeaInput
+from src.search.fts import SearchIndexService
+from src.tags.service import TagService
+from src.timeline.service import TimelineService
 
 _TITLE_MAX_LEN = 40
 
@@ -57,10 +64,10 @@ def invention_to_dict(invention: Invention) -> dict:
         "invention_no": invention.invention_no,
         "title": invention.title,
         "original_idea": invention.original_idea,
-        "keywords": invention.keywords or [],
         "status": invention.status,
         "is_favorite": invention.is_favorite,
         "is_archived": invention.is_archived,
+        "parent_invention_id": invention.parent_invention_id,
         "created_at": invention.created_at.isoformat() if invention.created_at else None,
         "updated_at": invention.updated_at.isoformat() if invention.updated_at else None,
         "version": invention.version,
@@ -74,6 +81,9 @@ class InventionService:
     def __init__(self, session: Session):
         self.session = session
         self.repo = InventionRepository(session)
+        self.tags = TagService(session)
+        self.timeline = TimelineService(session)
+        self.search_index = SearchIndexService(session)
 
     # ------------------------------------------------------------------
     # 생성
@@ -84,11 +94,12 @@ class InventionService:
         if errors:
             raise ValueError("; ".join(errors))
 
-        return self._create(
-            original_idea=data.memo.strip(),
-            title=data.title,
-            keywords=data.keywords or [],
-        )
+        invention = self._create(original_idea=data.memo.strip(), title=data.title)
+        if data.keywords:
+            self.tags.add_tags(invention.id, data.keywords)
+        self.timeline.log(invention.id, "created", description=invention.title)
+        self.search_index.reindex_invention(invention.id)
+        return invention
 
     def create(self, data: InventionInput) -> Invention:
         errors = data.validate()
@@ -98,27 +109,63 @@ class InventionService:
         invention = self._create(
             original_idea=data.original_idea.strip(),
             title=data.title,
-            keywords=data.keywords or [],
-            status=data.status or "아이디어",
+            status=data.status or DEFAULT_STATUS,
         )
         for name in _CONTENT_FIELDS:
             setattr(invention, name, getattr(data, name))
+        if data.keywords:
+            self.tags.add_tags(invention.id, data.keywords)
         self.session.flush()
+        self.timeline.log(invention.id, "created", description=invention.title)
+        self.search_index.reindex_invention(invention.id)
         return invention
+
+    def create_child(self, parent_id: str, data: QuickIdeaInput) -> Invention:
+        """기존 아이디어에서 파생된 새 아이디어를 만든다.
+
+        예: Separator 접합 → Graphene Fiber 방식. 지금은 UI에 노출하지
+        않지만, DB 구조와 서비스는 미리 준비해 둔다.
+        """
+        parent = self._require(parent_id)
+        errors = data.validate()
+        if errors:
+            raise ValueError("; ".join(errors))
+
+        child = self._create(original_idea=data.memo.strip(), title=data.title)
+        child.parent_invention_id = parent.id
+        if data.keywords:
+            self.tags.add_tags(child.id, data.keywords)
+        self.session.flush()
+
+        self.timeline.log(
+            child.id,
+            "derived_from_parent",
+            description=f"'{parent.title}'에서 파생됨",
+            meta={"parent_invention_id": parent.id},
+        )
+        self.timeline.log(
+            parent.id,
+            "derived_child_created",
+            description=f"'{child.title}' 파생 아이디어 생성",
+            meta={"child_invention_id": child.id},
+        )
+        self.search_index.reindex_invention(child.id)
+        return child
+
+    def list_children(self, invention_id: str) -> list[Invention]:
+        return self.repo.list_children(invention_id)
 
     def _create(
         self,
         original_idea: str,
         title: str = "",
-        keywords: list[str] | None = None,
-        status: str = "아이디어",
+        status: str = DEFAULT_STATUS,
     ) -> Invention:
         year = datetime.now(timezone.utc).year
         invention = Invention(
             invention_no=self.repo.next_invention_no(year),
             title=(title or "").strip() or generate_title(original_idea),
             original_idea=original_idea,
-            keywords=keywords or [],
             status=status,
         )
         return self.repo.add(invention)
@@ -138,31 +185,52 @@ class InventionService:
         new_original = data.original_idea.strip()
         if new_original != invention.original_idea:
             self._snapshot(invention, change_note="원본 아이디어 수정 전 자동 저장")
+            self.timeline.log(invention.id, "original_revised")
 
         invention.original_idea = new_original
         invention.title = (data.title or "").strip() or generate_title(new_original)
-        invention.keywords = data.keywords or []
+        old_status = invention.status
         invention.status = data.status or invention.status
         for name in _CONTENT_FIELDS:
             setattr(invention, name, getattr(data, name))
+        self.tags.set_tags_for_invention(invention.id, data.keywords or [])
         self.session.flush()
+
+        if invention.status != old_status:
+            self.timeline.log(
+                invention.id,
+                "status_changed",
+                description=f"{old_status} → {invention.status}",
+            )
+        self.search_index.reindex_invention(invention.id)
         return invention
 
     def update_fields(self, invention_id: str, **fields) -> Invention:
         """상세 화면에서 일부 항목만 저장할 때 사용한다.
 
         원본 아이디어(original_idea)는 이 경로로 바꿀 수 없다. 원본을 고치려면
-        `update()`를 써서 이전 버전이 남도록 한다.
+        `update_original_idea()`를 써서 이전 버전이 남도록 한다.
         """
         invention = self._require(invention_id)
-        allowed = set(_CONTENT_FIELDS) | {"title", "status", "keywords"}
+        allowed = set(_CONTENT_FIELDS) | {"title", "status"}
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"수정할 수 없는 항목입니다: {', '.join(sorted(unknown))}")
 
+        old_status = invention.status
         for name, value in fields.items():
             setattr(invention, name, value)
         self.session.flush()
+
+        if "status" in fields and invention.status != old_status:
+            self.timeline.log(
+                invention.id,
+                "status_changed",
+                description=f"{old_status} → {invention.status}",
+            )
+        elif set(fields) - {"status", "title"}:
+            self.timeline.log(invention.id, "content_updated")
+        self.search_index.reindex_invention(invention.id)
         return invention
 
     def update_original_idea(
@@ -182,7 +250,14 @@ class InventionService:
         )
         invention.original_idea = text
         self.session.flush()
+        self.timeline.log(invention.id, "original_revised")
+        self.search_index.reindex_invention(invention.id)
         return invention
+
+    def set_tags(self, invention_id: str, names: list[str]) -> None:
+        self._require(invention_id)
+        self.tags.set_tags_for_invention(invention_id, names)
+        self.search_index.reindex_invention(invention_id)
 
     # ------------------------------------------------------------------
     # 조회
@@ -194,7 +269,23 @@ class InventionService:
         return self.repo.list_all(include_archived=include_archived)
 
     def list_recent(self, limit: int = 5) -> list[Invention]:
+        """updated_at 기준 최근 항목 (하위 호환용 별칭)."""
+        return self.list_recently_updated(limit=limit)
+
+    def list_recently_created(self, limit: int = 5) -> list[Invention]:
+        return self.repo.list_by_created(limit=limit)
+
+    def list_recently_updated(self, limit: int = 5) -> list[Invention]:
         return self.repo.list_all(include_archived=False)[:limit]
+
+    def list_in_progress(self, limit: int | None = None) -> list[Invention]:
+        """'아이디어'도 '보관됨'도 아닌, 실제로 진행 중인 발명."""
+        items = [
+            i
+            for i in self.repo.list_all(include_archived=False)
+            if i.status not in (DEFAULT_STATUS, "보관됨")
+        ]
+        return items[:limit] if limit else items
 
     def list_favorites(self, limit: int | None = None) -> list[Invention]:
         items = [i for i in self.repo.list_all(include_archived=False) if i.is_favorite]
@@ -208,7 +299,7 @@ class InventionService:
         items = [
             i
             for i in self.repo.list_all(include_archived=False)
-            if i.status == "아이디어" and not (i.refined_content or "").strip()
+            if i.status == DEFAULT_STATUS and not (i.refined_content or "").strip()
         ]
         return items[:limit] if limit else items
 
@@ -219,8 +310,28 @@ class InventionService:
         status: str | None = None,
         include_archived: bool = False,
     ) -> list[Invention]:
+        """제목/원본 메모/발명 내용/태그/첨부파일 이름을 통합 검색한다.
+
+        FTS5 색인을 우선 쓰고, 색인에 검색어 토큰이 하나도 없으면(예:
+        특수문자만 입력) 제목/원본 메모만 보는 단순 검색으로 대체한다.
+        """
+        if keyword and keyword.strip():
+            matched_ids = self.search_index.search(keyword.strip())
+            if matched_ids:
+                return self.repo.search_by_ids(
+                    matched_ids,
+                    technical_field=technical_field,
+                    status=status,
+                    include_archived=include_archived,
+                )
+            return self.repo.search(
+                keyword=keyword,
+                technical_field=technical_field,
+                status=status,
+                include_archived=include_archived,
+            )
+
         return self.repo.search(
-            keyword=keyword,
             technical_field=technical_field,
             status=status,
             include_archived=include_archived,
@@ -231,11 +342,13 @@ class InventionService:
     # ------------------------------------------------------------------
     def delete(self, invention_id: str) -> None:
         self.repo.delete(self._require(invention_id))
+        self.search_index.remove(invention_id)
 
     def set_archived(self, invention_id: str, archived: bool) -> Invention:
         invention = self._require(invention_id)
         invention.is_archived = archived
         self.session.flush()
+        self.timeline.log(invention.id, "archived" if archived else "unarchived")
         return invention
 
     def toggle_favorite(self, invention_id: str) -> Invention:
@@ -245,13 +358,16 @@ class InventionService:
         return invention
 
     # ------------------------------------------------------------------
-    # 버전
+    # 버전 / Timeline
     # ------------------------------------------------------------------
     def save_revision(self, invention_id: str, change_note: str | None = None) -> InventionRevision:
         return self._snapshot(self._require(invention_id), change_note=change_note)
 
     def list_revisions(self, invention_id: str) -> list[InventionRevision]:
         return self.repo.list_revisions(invention_id)
+
+    def list_timeline(self, invention_id: str):
+        return self.timeline.list_for_invention(invention_id)
 
     # ------------------------------------------------------------------
     # 내부 헬퍼

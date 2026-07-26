@@ -43,10 +43,19 @@ _NEW_COLUMNS = {
     "experiment_notes",
     "review_notes",
     "is_favorite",
+    "parent_invention_id",
+    "owner_id",
 }
 
 
 def _old_db(tmp_path):
+    """실제 앱 흐름을 흉내낸다: 옛 `inventions` 테이블이 이미 있는 상태에서
+    `Base.metadata.create_all()`을 실행하면(=init_engine이 항상 먼저 하는 일),
+    `inventions`는 그대로 두고 그 사이에 새로 생긴 테이블(tags, invention_tags,
+    experiments 등)만 만들어진다. 그다음에 `run_migrations()`가 컬럼을 보충한다.
+    """
+    from src.database.models import Base
+
     engine = create_engine(f"sqlite:///{tmp_path / 'old.db'}")
     with engine.begin() as conn:
         conn.execute(text(_OLD_SCHEMA))
@@ -58,6 +67,7 @@ def _old_db(tmp_path):
                 "'아이디어', 1)"
             )
         )
+    Base.metadata.create_all(engine)
     return engine
 
 
@@ -104,3 +114,85 @@ def test_migration_noop_on_fresh_schema(tmp_path):
     Base.metadata.create_all(engine)
 
     assert run_migrations(engine) == []
+
+
+def test_migration_remaps_legacy_status_values(tmp_path):
+    engine = _old_db(tmp_path)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO inventions "
+                "(id, invention_no, title, original_idea, status, version) "
+                "VALUES ('id-2', 'INV-2026-00002', '예전 상태값', '본문', "
+                "'출원 검토', 1)"
+            )
+        )
+
+    run_migrations(engine)
+
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT status FROM inventions WHERE id='id-2'")
+        ).one()
+    assert row.status == "특허 검토"
+
+
+def _fresh_engine_with_invention(tmp_path, db_name: str, invention_id: str, keywords: list[str]):
+    from sqlalchemy.orm import sessionmaker
+
+    from src.database.models import Base, Invention
+
+    engine = create_engine(f"sqlite:///{tmp_path / db_name}")
+    Base.metadata.create_all(engine)
+
+    session = sessionmaker(bind=engine)()
+    try:
+        session.add(
+            Invention(
+                id=invention_id,
+                invention_no=f"INV-2026-{invention_id}",
+                title="태그 이전 테스트",
+                original_idea="본문",
+                status="아이디어",
+                version=1,
+                keywords=keywords,
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+    return engine
+
+
+def test_migration_backfills_tags_from_keywords_json(tmp_path):
+    engine = _fresh_engine_with_invention(
+        tmp_path, "fresh.db", "id-3", ["Battery", "Robot"]
+    )
+
+    run_migrations(engine)
+
+    with engine.connect() as conn:
+        names = {
+            row.name
+            for row in conn.execute(
+                text(
+                    "SELECT t.name FROM tags t "
+                    "JOIN invention_tags it ON it.tag_id = t.id "
+                    "WHERE it.invention_id = 'id-3'"
+                )
+            )
+        }
+    assert names == {"Battery", "Robot"}
+
+
+def test_migration_backfill_is_idempotent(tmp_path):
+    engine = _fresh_engine_with_invention(tmp_path, "fresh.db", "id-4", ["AI"])
+
+    run_migrations(engine)
+    run_migrations(engine)
+
+    with engine.connect() as conn:
+        count = conn.execute(
+            text("SELECT COUNT(*) FROM invention_tags WHERE invention_id='id-4'")
+        ).scalar()
+    assert count == 1

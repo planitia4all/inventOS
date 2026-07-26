@@ -134,6 +134,41 @@ def test_apply_ai_comparison_draft_without_draft_raises(db_session):
         service.apply_ai_comparison_draft(link.id)
 
 
+def test_register_manual_logs_timeline_event(db_session):
+    invention = make_invention(db_session)
+    service = PatentService(db_session)
+    service.register_manual(invention.id, make_patent_input())
+
+    from src.inventions.service import InventionService
+
+    types = [e.event_type for e in InventionService(db_session).list_timeline(invention.id)]
+    assert "prior_art_linked" in types
+
+
+def test_apply_ai_comparison_draft_logs_timeline_event(db_session):
+    invention = make_invention(db_session)
+    service = PatentService(db_session)
+    link = service.register_manual(invention.id, make_patent_input())
+    service.save_ai_comparison_draft(
+        link.id,
+        {
+            "similarities": ["A"],
+            "differences": [],
+            "prior_patent_core": "",
+            "possible_differentiators": [],
+            "technical_risks": [],
+            "additional_search_terms": [],
+            "confidence": 50,
+        },
+    )
+    service.apply_ai_comparison_draft(link.id)
+
+    from src.inventions.service import InventionService
+
+    types = [e.event_type for e in InventionService(db_session).list_timeline(invention.id)]
+    assert "ai_result_applied" in types
+
+
 def test_delete_link_removes_from_invention_but_keeps_patent(db_session):
     invention = make_invention(db_session)
     service = PatentService(db_session)

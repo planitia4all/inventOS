@@ -9,6 +9,7 @@ from src.database.models import InventionPatentLink, PatentDocument
 from src.patents.providers.base import PatentDetail, normalize_publication_number
 from src.patents.repository import PatentRepository
 from src.patents.schemas import ComparisonInput, ManualPatentInput
+from src.timeline.service import TimelineService
 
 
 class DuplicatePatentLinkError(Exception):
@@ -105,7 +106,11 @@ class PatentService:
         if existing_link:
             raise DuplicatePatentLinkError("이미 이 발명에 연결된 특허입니다.")
         link = InventionPatentLink(invention_id=invention_id, patent_id=patent_id)
-        return self.repo.add_link(link)
+        link = self.repo.add_link(link)
+        TimelineService(self.session).log(
+            invention_id, "prior_art_linked", description=link.patent.title
+        )
+        return link
 
     def list_for_invention(self, invention_id: str) -> list[InventionPatentLink]:
         return self.repo.list_links_for_invention(invention_id)
@@ -179,4 +184,9 @@ class PatentService:
         link.differentiation_ideas = "\n".join(draft.get("possible_differentiators", []))
         link.additional_research = "\n".join(draft.get("additional_search_terms", []))
         self.session.flush()
+        TimelineService(self.session).log(
+            link.invention_id,
+            "ai_result_applied",
+            description=f"'{link.patent.title}' 비교 AI 초안 적용",
+        )
         return link
