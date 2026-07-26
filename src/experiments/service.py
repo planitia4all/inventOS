@@ -13,6 +13,26 @@ from src.experiments.schemas import ExperimentInput
 from src.timeline.service import TimelineService
 
 
+def draft_text_from_experiment(experiment: Experiment) -> str:
+    """실험 기록을 새 파생 아이디어의 '초안'으로 바꾼다.
+
+    그대로 복사해서 저장하지 않는다 — 사용자가 확인하고 다듬을 수 있도록
+    캡처 화면의 메모 입력칸에 미리 채워 넣기만 하는 용도다.
+    """
+    lines = ["[실험 기록에서 파생된 아이디어 — 내용을 확인하고 다듬어 주세요]"]
+    if experiment.experiment_date:
+        lines.append(f"실험 날짜: {experiment.experiment_date.isoformat()}")
+    if experiment.conditions:
+        lines.append(f"조건: {experiment.conditions}")
+    if experiment.results:
+        lines.append(f"결과: {experiment.results}")
+    if experiment.failure_reason:
+        lines.append(f"실패 원인: {experiment.failure_reason}")
+    if experiment.improvement_ideas:
+        lines.append(f"개선 아이디어: {experiment.improvement_ideas}")
+    return "\n".join(lines)
+
+
 class ExperimentService:
     def __init__(self, session: Session):
         self.session = session
@@ -53,6 +73,9 @@ class ExperimentService:
         experiment.improvement_ideas = data.improvement_ideas
         self.session.flush()
         return experiment
+
+    def get(self, experiment_id: str) -> Experiment | None:
+        return self.session.get(Experiment, experiment_id)
 
     def list_for_invention(self, invention_id: str) -> list[Experiment]:
         stmt = (

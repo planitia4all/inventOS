@@ -10,12 +10,48 @@ import streamlit as st
 from src.attachments.service import AttachmentError, AttachmentService
 from src.database.engine import get_session
 from src.drafts.store import DraftStore
-from src.inventions.schemas import QuickIdeaInput
+from src.inventions.schemas import DERIVATION_COPY_FIELDS, DERIVATION_REASONS, QuickIdeaInput
 from src.inventions.service import InventionService
 from src.ui.components.layout import go
 
 _DRAFT_KEY = "quick_capture"
 _MEMO_WIDGET = "capture_memo"
+
+# 파생 아이디어 모드로 캡처 화면에 들어왔을 때만 쓰는 session_state 키.
+_DERIVE_KEYS = (
+    "derive_parent_id",
+    "derive_parent_no",
+    "derive_parent_title",
+    "derive_source_experiment_id",
+    "derive_memo_prefilled",
+)
+
+
+def clear_derive_context() -> None:
+    """파생 모드가 아닌 '새 아이디어 기록' 진입점에서 반드시 호출해야 한다.
+
+    안 그러면 이전에 시작했다가 끝내지 않은 파생 흐름의 배너/체크박스가
+    엉뚱하게 새 기록 화면에 남아 있게 된다.
+    """
+    for key in _DERIVE_KEYS:
+        st.session_state.pop(key, None)
+
+
+def start_derive_capture(
+    parent_id: str,
+    parent_no: str,
+    parent_title: str,
+    source_experiment_id: str | None = None,
+) -> None:
+    """상세 화면의 '파생 아이디어 만들기' 버튼이 호출한다."""
+    st.session_state["derive_parent_id"] = parent_id
+    st.session_state["derive_parent_no"] = parent_no
+    st.session_state["derive_parent_title"] = parent_title
+    st.session_state["derive_source_experiment_id"] = source_experiment_id
+    st.session_state.pop("derive_memo_prefilled", None)
+    st.session_state.page = "capture"
+    st.session_state.current_invention_id = None
+    st.rerun()
 
 
 def _keywords_from_text(text: str) -> list[str]:
@@ -61,12 +97,54 @@ def _save_attachments(session, invention_id: str, uploads) -> list[str]:
 def render() -> None:
     draft_store = DraftStore()
 
-    st.title("새 아이디어")
-    st.caption("생각나는 대로 적어두세요. 제목과 정리는 나중에 해도 됩니다.")
+    parent_id = st.session_state.get("derive_parent_id")
+    parent_no = st.session_state.get("derive_parent_no")
+    parent_title = st.session_state.get("derive_parent_title")
+    source_experiment_id = st.session_state.get("derive_source_experiment_id")
+    is_derive_mode = bool(parent_id)
+
+    st.title("파생 아이디어 만들기" if is_derive_mode else "새 아이디어")
+    if is_derive_mode:
+        st.info(f"🌱 '{parent_title}'({parent_no})에서 파생되는 아이디어입니다.")
+    else:
+        st.caption("생각나는 대로 적어두세요. 제목과 정리는 나중에 해도 됩니다.")
 
     # 이전에 쓰다 만 내용이 있으면 되살린다.
     if _MEMO_WIDGET not in st.session_state:
         st.session_state[_MEMO_WIDGET] = draft_store.get(_DRAFT_KEY)
+
+    copy_fields: list[str] = []
+    copy_tags = False
+    copy_attachments = False
+    derivation_reason: str | None = None
+
+    if is_derive_mode:
+        with st.expander("부모 발명에서 가져올 내용 (선택)", expanded=True):
+            st.caption("기본값은 관계만 연결합니다. 필요한 것만 골라서 가져오세요.")
+            copy_memo = st.checkbox("원본 메모 가져오기", key="derive_copy_memo")
+            if copy_memo and not st.session_state.get("derive_memo_prefilled"):
+                with get_session() as session:
+                    parent = InventionService(session).get(parent_id)
+                    if parent is not None:
+                        st.session_state[_MEMO_WIDGET] = parent.original_idea
+                st.session_state["derive_memo_prefilled"] = True
+            elif not copy_memo:
+                st.session_state["derive_memo_prefilled"] = False
+
+            for field_label, field_name in DERIVATION_COPY_FIELDS:
+                if st.checkbox(f"{field_label} 가져오기", key=f"derive_copy_{field_name}"):
+                    copy_fields.append(field_name)
+            copy_tags = st.checkbox("태그 가져오기", key="derive_copy_tags")
+            copy_attachments = st.checkbox("첨부파일 가져오기", key="derive_copy_attachments")
+
+            reason_choice = st.selectbox(
+                "파생 이유", DERIVATION_REASONS, key="derive_reason_choice"
+            )
+            if reason_choice == "기타":
+                custom_reason = st.text_input("파생 이유 (직접 입력)", key="derive_reason_custom")
+                derivation_reason = custom_reason.strip() or "기타"
+            else:
+                derivation_reason = reason_choice
 
     memo = st.text_area(
         "아이디어 내용",
@@ -113,7 +191,18 @@ def render() -> None:
             return
 
         with get_session() as session:
-            invention = InventionService(session).quick_create(data)
+            if is_derive_mode:
+                invention = InventionService(session).create_child(
+                    parent_id,
+                    data,
+                    derivation_reason=derivation_reason,
+                    copy_fields=copy_fields,
+                    copy_tags=copy_tags,
+                    copy_attachments=copy_attachments,
+                    source_experiment_id=source_experiment_id,
+                )
+            else:
+                invention = InventionService(session).quick_create(data)
             uploads = [photo, voice] + list(files or [])
             problems = _save_attachments(session, invention.id, uploads)
             invention_id = invention.id
@@ -122,10 +211,12 @@ def render() -> None:
         draft_store.clear(_DRAFT_KEY)
         for widget in (_MEMO_WIDGET, "capture_title", "capture_tags"):
             st.session_state.pop(widget, None)
+        clear_derive_context()
 
         if problems:
             st.warning("일부 첨부파일을 저장하지 못했습니다: " + " / ".join(problems))
         go("detail", invention_id)
 
     if st.button("취소", key="capture_cancel"):
+        clear_derive_context()
         go("home")

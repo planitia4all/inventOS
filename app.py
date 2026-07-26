@@ -35,6 +35,7 @@ nav = nav_row(3)
 if nav[0].button("🏠 홈", key="nav_home"):
     go("home")
 if nav[1].button("➕ 새 기록", key="nav_capture"):
+    quick_capture.clear_derive_context()
     go("capture")
 if nav[2].button("📚 목록", key="nav_list"):
     go("list")

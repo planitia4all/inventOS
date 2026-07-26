@@ -13,21 +13,33 @@ from datetime import date
 
 import streamlit as st
 
+from src.ai.base import AIProviderError
+from src.ai.providers.factory import get_ai_provider
+from src.ai.results_service import RESULT_KINDS, AIResultService
+from src.ai.review import (
+    PARTIAL_APPLY_FIELD_LABELS,
+    PARTIAL_APPLY_FIELDS,
+    REVIEW_DEFAULT_FIELD,
+    REVIEW_GROUPS,
+    build_context,
+)
 from src.attachments.service import (
     ATTACHMENT_CATEGORIES,
     AttachmentError,
     AttachmentService,
     attachment_kind,
 )
+from src.config.settings import get_settings
 from src.database.engine import get_session
 from src.drafts.store import DraftStore
 from src.experiments.schemas import ExperimentInput
-from src.experiments.service import ExperimentService
-from src.inventions.schemas import DETAIL_GROUPS, FIELD_LABELS, STATUS_VALUES
+from src.experiments.service import ExperimentService, draft_text_from_experiment
+from src.inventions.schemas import DERIVATION_COPY_FIELDS, DETAIL_GROUPS, FIELD_LABELS, STATUS_VALUES
 from src.inventions.service import InventionService
 from src.reports.markdown_exporter import export_invention_markdown
 from src.ui.components.actions import run_and_rerun
 from src.ui.components.layout import go
+from src.ui.pages.quick_capture import clear_derive_context, start_derive_capture
 
 
 def _render_header(invention) -> None:
@@ -153,6 +165,171 @@ def _render_group_editors(invention) -> None:
                 )
 
 
+def _run_ai_review(invention_id: str, kind: str, label: str) -> None:
+    """AI 검토 버튼 하나의 실행 흐름.
+
+    AI 호출은 DB 쓰기 세션 밖에서 하고(실패해도 발명 내용에 영향 없음),
+    성공했을 때만 결과를 InventionAIResult로 저장한다 — 저장 자체는 짧은
+    트랜잭션 하나(run_and_rerun)라 실패하면 부분 저장 없이 전부 롤백된다.
+    """
+    processing_key = f"ai_review_running_{invention_id}"
+    if st.session_state.get(processing_key):
+        st.warning("이미 처리 중입니다. 잠시만 기다려 주세요.")
+        return
+
+    st.session_state[processing_key] = True
+    try:
+        settings = get_settings()
+        provider, warning = get_ai_provider(settings)
+        if warning:
+            st.info(warning)
+        with st.spinner(f"{label} 실행 중..."):
+            with get_session() as read_session:
+                fresh = InventionService(read_session).get(invention_id)
+                context = build_context(fresh)
+                content = provider.review_invention(fresh, kind)
+        model_name = getattr(provider, "model", None)
+        run_and_rerun(
+            lambda session, k=kind, c=content, ctx=context, pname=provider.name, m=model_name: (
+                AIResultService(session).create_draft(
+                    invention_id, k, c, provider=pname, model=m, input_snapshot=ctx
+                )
+            )
+        )
+    except AIProviderError as exc:
+        st.error(f"{label} 실행에 실패했습니다.\n\n{exc}\n\n발명 내용은 변경되지 않았습니다.")
+    finally:
+        st.session_state[processing_key] = False
+
+
+def _render_ai_review(invention) -> None:
+    with st.expander("🤖 AI로 검토하기", expanded=False):
+        st.caption(
+            "버튼을 누르면 AI가 참고용 초안을 만듭니다. 아래 'AI 검토 결과'에서 "
+            "직접 반영을 눌러야만 발명 내용이 바뀝니다."
+        )
+        for group_name, items in REVIEW_GROUPS:
+            st.markdown(f"**{group_name}**")
+            cols = st.columns(2)
+            for i, (kind, label) in enumerate(items):
+                if cols[i % 2].button(label, key=f"ai_review_{kind}_{invention.id}"):
+                    _run_ai_review(invention.id, kind, label)
+
+
+def _render_ai_results(invention) -> None:
+    with get_session() as session:
+        results = AIResultService(session).list_for_invention(invention.id)
+
+    if not results:
+        return
+
+    # 오래된 것부터 번호를 매겨 같은 종류를 "1차/2차..."로 구분한다.
+    ordinal: dict[str, int] = {}
+    counters: dict[str, int] = {}
+    for r in reversed(results):
+        counters[r.kind] = counters.get(r.kind, 0) + 1
+        ordinal[r.id] = counters[r.kind]
+
+    pending_count = sum(1 for r in results if r.status == "생성됨")
+    with st.expander(f"AI 검토 결과 ({len(results)}건, 대기 {pending_count}건)", expanded=pending_count > 0):
+        for r in results:
+            label = RESULT_KINDS.get(r.kind, r.kind)
+            status_badge = {"반영됨": " · ✅ 반영됨", "보관됨": " · 📦 보관됨"}.get(r.status, "")
+            with st.container(border=True):
+                st.markdown(f"**{label} {ordinal[r.id]}차**{status_badge}")
+                meta = r.created_at.strftime("%Y-%m-%d %H:%M") + f" · {r.provider}"
+                if r.model:
+                    meta += f"/{r.model}"
+                st.caption(meta)
+                st.write(r.content)
+
+                if r.status == "생성됨":
+                    action_cols = st.columns(2)
+                    if action_cols[0].button("전체 반영", key=f"apply_all_{r.id}"):
+                        run_and_rerun(
+                            lambda session, rid=r.id: AIResultService(session).apply(rid)
+                        )
+                    if action_cols[1].button("보관", key=f"archive_{r.id}"):
+                        run_and_rerun(
+                            lambda session, rid=r.id: AIResultService(session).archive(rid)
+                        )
+
+                    with st.expander("일부만 반영", expanded=False):
+                        default_field = REVIEW_DEFAULT_FIELD.get(r.kind)
+                        field_keys = [f for f, _ in PARTIAL_APPLY_FIELDS]
+                        chosen = st.multiselect(
+                            "반영할 항목 선택",
+                            options=field_keys,
+                            default=[default_field] if default_field in field_keys else [],
+                            format_func=lambda f: PARTIAL_APPLY_FIELD_LABELS.get(f, f),
+                            key=f"partial_fields_{r.id}",
+                        )
+                        if st.button("선택한 항목에 반영", key=f"apply_partial_{r.id}"):
+                            if not chosen:
+                                st.warning("반영할 항목을 하나 이상 선택하세요.")
+                            else:
+                                run_and_rerun(
+                                    lambda session, rid=r.id, fields=chosen: AIResultService(
+                                        session
+                                    ).apply(rid, target_fields=fields)
+                                )
+
+                    redo_cols = st.columns(2)
+                    if redo_cols[0].button("다시 생성", key=f"redo_{r.id}"):
+                        _run_ai_review(invention.id, r.kind, label)
+                    if redo_cols[1].button("삭제", key=f"discard_{r.id}"):
+                        run_and_rerun(
+                            lambda session, rid=r.id: AIResultService(session).discard(rid)
+                        )
+                elif r.applied_fields:
+                    applied_labels = ", ".join(
+                        PARTIAL_APPLY_FIELD_LABELS.get(f, f) for f in r.applied_fields
+                    )
+                    st.caption(f"반영된 항목: {applied_labels}")
+
+
+def _render_related_ideas(invention) -> None:
+    with get_session() as session:
+        service = InventionService(session)
+        parent = service.get(invention.parent_invention_id) if invention.parent_invention_id else None
+        children = service.list_children(invention.id)
+
+    label = "관련 아이디어"
+    if children:
+        label += f" (파생 {len(children)}건)"
+    with st.expander(label, expanded=False):
+        st.caption("부모/파생 아이디어를 카드로 보여줍니다.")
+
+        if st.button("🌱 이 발명에서 파생 아이디어 만들기", key=f"derive_from_detail_{invention.id}"):
+            start_derive_capture(invention.id, invention.invention_no, invention.title)
+
+        if invention.derivation_reason:
+            st.caption(f"이 발명의 파생 이유: {invention.derivation_reason}")
+
+        if parent is not None:
+            st.markdown("**부모 발명**")
+            with st.container(border=True):
+                st.markdown(f"{parent.invention_no} · {parent.title}")
+                st.caption(f"상태: {parent.status}")
+                if st.button("부모 발명 열기", key=f"open_parent_{invention.id}"):
+                    go("detail", parent.id)
+
+        if children:
+            st.markdown(f"**파생 발명 ({len(children)}건)**")
+            for child in children:
+                with st.container(border=True):
+                    st.markdown(f"{child.invention_no} · {child.title}")
+                    meta = f"상태: {child.status} · 생성 {child.created_at.strftime('%Y-%m-%d')}"
+                    if child.derivation_reason:
+                        meta += f" · 파생 이유: {child.derivation_reason}"
+                    st.caption(meta)
+                    if st.button("열기", key=f"open_child_{child.id}"):
+                        go("detail", child.id)
+
+        if parent is None and not children:
+            st.caption("아직 연결된 부모/파생 발명이 없습니다.")
+
+
 def _render_experiments(invention) -> None:
     with get_session() as session:
         experiments = ExperimentService(session).list_for_invention(invention.id)
@@ -203,7 +380,18 @@ def _render_experiments(invention) -> None:
                     st.markdown(f"- 실패 원인: {exp.failure_reason}")
                 if exp.improvement_ideas:
                     st.markdown(f"- 개선 아이디어: {exp.improvement_ideas}")
-                if st.button("삭제", key=f"exp_del_{exp.id}"):
+                exp_cols = st.columns(2)
+                if exp_cols[0].button("🌱 이 실험 결과로 파생 아이디어 만들기", key=f"exp_derive_{exp.id}"):
+                    # start_derive_capture()는 끝에서 st.rerun()을 호출해 실행을
+                    # 즉시 끊으므로, 초안 메모는 반드시 그 전에 심어 둬야 한다.
+                    st.session_state["capture_memo"] = draft_text_from_experiment(exp)
+                    start_derive_capture(
+                        invention.id,
+                        invention.invention_no,
+                        invention.title,
+                        source_experiment_id=exp.id,
+                    )
+                if exp_cols[1].button("삭제", key=f"exp_del_{exp.id}"):
                     run_and_rerun(
                         lambda session, exp_id=exp.id: ExperimentService(session).delete(
                             exp_id
@@ -363,6 +551,7 @@ def render(invention_id: str | None) -> None:
     if not invention_id:
         st.info("먼저 아이디어를 선택하거나 새로 기록하세요.")
         if st.button("새 아이디어 기록", key="detail_to_capture"):
+            clear_derive_context()
             go("capture")
         return
 
@@ -380,6 +569,10 @@ def render(invention_id: str | None) -> None:
         _render_filled_sections(invention)
         st.divider()
         _render_group_editors(invention)
+        st.divider()
+        _render_ai_review(invention)
+        _render_ai_results(invention)
+        _render_related_ideas(invention)
         st.divider()
         _render_experiments(invention)
         _render_attachments(invention)

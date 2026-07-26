@@ -71,3 +71,11 @@ class AIProvider(Protocol):
         self, invention: Invention, patent: PatentDocument
     ) -> PatentComparisonDraft:
         ...
+
+    def review_invention(self, invention: Invention, kind: str) -> str:
+        """'AI로 검토하기'의 한 항목(예: 아이디어 정리, 실현 가능성 검토)을 실행한다.
+
+        결과 텍스트만 반환한다 — 발명 내용을 저장/수정하는 것은 이 함수의
+        책임이 아니다 (호출한 쪽이 InventionAIResult로 별도 저장한다).
+        """
+        ...

@@ -8,6 +8,7 @@ UI는 이 계층만 호출하고, ORM/DB 세부사항을 직접 다루지 않는
 """
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime, timezone
 
@@ -19,6 +20,8 @@ from src.inventions.schemas import DEFAULT_STATUS, InventionInput, QuickIdeaInpu
 from src.search.fts import SearchIndexService
 from src.tags.service import TagService
 from src.timeline.service import TimelineService
+
+logger = logging.getLogger(__name__)
 
 _TITLE_MAX_LEN = 40
 
@@ -78,8 +81,9 @@ def invention_to_dict(invention: Invention) -> dict:
 
 
 class InventionService:
-    def __init__(self, session: Session):
+    def __init__(self, session: Session, settings=None):
         self.session = session
+        self.settings = settings
         self.repo = InventionRepository(session)
         self.tags = TagService(session)
         self.timeline = TimelineService(session)
@@ -120,11 +124,26 @@ class InventionService:
         self.search_index.reindex_invention(invention.id)
         return invention
 
-    def create_child(self, parent_id: str, data: QuickIdeaInput) -> Invention:
+    def create_child(
+        self,
+        parent_id: str,
+        data: QuickIdeaInput,
+        derivation_reason: str | None = None,
+        copy_fields: list[str] | None = None,
+        copy_tags: bool = False,
+        copy_attachments: bool = False,
+        source_experiment_id: str | None = None,
+    ) -> Invention:
         """기존 아이디어에서 파생된 새 아이디어를 만든다.
 
-        예: Separator 접합 → Graphene Fiber 방식. 지금은 UI에 노출하지
-        않지만, DB 구조와 서비스는 미리 준비해 둔다.
+        예: Separator 접합 → Graphene Fiber 방식. 기본값은 관계만 연결하고
+        (copy_fields/copy_tags/copy_attachments를 모두 비워 두면), 필요한
+        내용만 선택적으로 부모에서 가져올 수 있다.
+
+        핵심 관계(부모 연결 + 양쪽 Timeline 기록)는 이 메서드 하나가 같은
+        세션 안에서 전부 처리한다 — 호출하는 쪽(UI)이 `run_and_rerun`처럼
+        하나의 짧은 트랜잭션으로 감싸서 실행하면, 중간에 실패했을 때 부모
+        관계만 반쯤 만들어지는 일 없이 전체가 롤백된다.
         """
         parent = self._require(parent_id)
         errors = data.validate()
@@ -133,24 +152,75 @@ class InventionService:
 
         child = self._create(original_idea=data.memo.strip(), title=data.title)
         child.parent_invention_id = parent.id
+        child.derivation_reason = derivation_reason
+        child.source_experiment_id = source_experiment_id
+
+        for field in copy_fields or []:
+            if field not in _CONTENT_FIELDS:
+                raise ValueError(f"복사할 수 없는 항목입니다: {field}")
+            value = getattr(parent, field)
+            if value:
+                setattr(child, field, value)
+
         if data.keywords:
             self.tags.add_tags(child.id, data.keywords)
+        if copy_tags:
+            parent_tag_names = self.tags.tag_names(parent.id)
+            if parent_tag_names:
+                self.tags.add_tags(child.id, parent_tag_names)
+
+        if copy_attachments:
+            self._copy_attachments(parent.id, child.id)
+
         self.session.flush()
 
+        reason_note = f" ({derivation_reason})" if derivation_reason else ""
         self.timeline.log(
             child.id,
             "derived_from_parent",
-            description=f"'{parent.title}'에서 파생됨",
-            meta={"parent_invention_id": parent.id},
+            description=f"'{parent.title}'({parent.invention_no})에서 파생됨{reason_note}",
+            meta={
+                "parent_invention_id": parent.id,
+                "parent_invention_no": parent.invention_no,
+                "parent_title": parent.title,
+                "derivation_reason": derivation_reason,
+            },
         )
         self.timeline.log(
             parent.id,
             "derived_child_created",
-            description=f"'{child.title}' 파생 아이디어 생성",
-            meta={"child_invention_id": child.id},
+            description=f"'{child.title}'({child.invention_no}) 파생 아이디어 생성{reason_note}",
+            meta={
+                "child_invention_id": child.id,
+                "child_invention_no": child.invention_no,
+                "child_title": child.title,
+                "derivation_reason": derivation_reason,
+            },
         )
         self.search_index.reindex_invention(child.id)
         return child
+
+    def _copy_attachments(self, parent_id: str, child_id: str) -> None:
+        """부모의 첨부파일을 실제로 복사해 자식에 붙인다.
+
+        파일 하나가 복사에 실패해도(예: 원본 파일이 디스크에서 사라짐)
+        나머지 복사와 파생 아이디어 생성 자체는 계속 진행한다 — DB 행과
+        실제 파일이 항상 함께 만들어지도록 보장하는 `AttachmentService.save()`를
+        그대로 재사용하므로, 실패한 파일은 자식 쪽에 아무 흔적도 남기지 않는다.
+        """
+        from src.attachments.service import AttachmentError, AttachmentService
+
+        attachment_service = AttachmentService(self.session, settings=self.settings)
+        for attachment in attachment_service.list_for_invention(parent_id):
+            try:
+                attachment_service.copy_to_invention(attachment, child_id)
+            except (AttachmentError, OSError) as exc:
+                logger.warning(
+                    "첨부파일 복사 실패 (parent=%s, file=%s): %s",
+                    parent_id,
+                    attachment.original_filename,
+                    exc,
+                )
 
     def list_children(self, invention_id: str) -> list[Invention]:
         return self.repo.list_children(invention_id)

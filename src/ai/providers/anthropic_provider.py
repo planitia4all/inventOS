@@ -11,6 +11,7 @@ import json
 import anthropic
 
 from src.ai.base import AIProviderError, PatentComparisonDraft, SearchTerms
+from src.ai.review import PROMPT_INSTRUCTIONS, build_context
 from src.database.models import Invention, PatentDocument
 
 _SEARCH_TERMS_SCHEMA = {
@@ -169,3 +170,13 @@ additional_search_terms(추가 검색어), confidence(0~100 신뢰도)를 포함
 반환하세요."""
         data = self._call_json(prompt, _COMPARISON_SCHEMA)
         return PatentComparisonDraft(**data)
+
+    def review_invention(self, invention: Invention, kind: str) -> str:
+        instruction = PROMPT_INSTRUCTIONS.get(kind, "다음 발명을 검토하세요.")
+        prompt = (
+            f"{build_context(invention)}\n\n"
+            f"요청: {instruction}\n"
+            "한국어로, 발명 노트에 바로 옮겨 적을 수 있는 간결한 문장으로 답하세요. "
+            "법적 판단(신규성/진보성 등)이 아닌 검토 참고용임을 유의하세요."
+        )
+        return self._call_text(prompt)

@@ -11,6 +11,7 @@ from src.database.engine import get_session
 from src.inventions.schemas import STATUS_VALUES
 from src.inventions.service import InventionService
 from src.ui.components.layout import go, idea_card
+from src.ui.pages.quick_capture import clear_derive_context
 
 _STATUS_ALL = "전체"
 
@@ -19,6 +20,7 @@ def render() -> None:
     st.title("전체 목록")
 
     if st.button("➕ 새 아이디어 기록", type="primary", key="list_new"):
+        clear_derive_context()
         go("capture")
 
     keyword = st.text_input(

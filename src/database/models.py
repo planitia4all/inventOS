@@ -62,9 +62,15 @@ class Invention(Base):
     is_archived: Mapped[bool] = mapped_column(default=False)
 
     # 파생 아이디어(부모→자식) 관계. 예: Separator 접합 → Graphene Fiber 방식.
-    # 지금은 DB 구조만 준비하고 UI에는 노출하지 않는다.
     parent_invention_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("inventions.id"), nullable=True
+    )
+    # 파생 이유. 자유 문자열(추천값은 DERIVATION_REASONS, 강제는 아님) — 단순
+    # Parent/Child 구조는 유지하되 "왜 파생됐는지"만 이 필드에 덧붙인다.
+    derivation_reason: Mapped[str | None] = mapped_column(String(200))
+    # 실험 기록에서 파생된 아이디어면 그 실험을 가리킨다 (선택).
+    source_experiment_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("experiments.id"), nullable=True
     )
 
     # 다중 사용자 확장을 대비한 자리. 지금은 단일 사용자라 항상 None이고
@@ -93,7 +99,9 @@ class Invention(Base):
         back_populates="invention", cascade="all, delete-orphan"
     )
     experiments: Mapped[list["Experiment"]] = relationship(
-        back_populates="invention", cascade="all, delete-orphan"
+        back_populates="invention",
+        cascade="all, delete-orphan",
+        foreign_keys="[Experiment.invention_id]",
     )
     comments: Mapped[list["InventionComment"]] = relationship(
         back_populates="invention", cascade="all, delete-orphan"
@@ -219,10 +227,22 @@ class InventionAIResult(Base):
     source_field: Mapped[str | None] = mapped_column(String(50))
     content: Mapped[str] = mapped_column(Text, nullable=False)
     provider: Mapped[str] = mapped_column(String(50), default="mock")
+    # AI 호출에 사용한 모델명 (예: claude-sonnet-5). Mock일 때는 None.
+    model: Mapped[str | None] = mapped_column(String(100))
+    # AI에게 실제로 넘긴 입력(원본 메모 + 관련 필드 요약). 나중에 "무엇을 보고
+    # 이 결과가 나왔는지" 추적할 수 있도록 결과와 함께 그대로 저장해 둔다.
+    input_snapshot: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     # 적용 전에는 둘 다 None. 적용하는 순간 시각과 반영된 발명 필드명이 채워진다.
     applied_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # 하위 호환용 단일 필드(예전 코드/데이터). 새로 쓸 때는 applied_fields를 쓴다.
     applied_to_field: Mapped[str | None] = mapped_column(String(50))
+    # 일부만 반영을 지원하기 위한 다중 필드 목록.
+    applied_fields: Mapped[list[str] | None] = mapped_column(JSON)
+    # 생성됨(기본) / 반영됨 / 보관됨 / 삭제됨. 자유 문자열이라 새 상태를
+    # 추가해도 스키마 변경이 필요 없다. 삭제도 실제로는 소프트 삭제라서
+    # "생각이 어떻게 발전했는지"의 기록이 사라지지 않는다.
+    status: Mapped[str] = mapped_column(String(20), default="생성됨")
 
     invention: Mapped["Invention"] = relationship(back_populates="ai_results")
 
@@ -271,7 +291,9 @@ class Experiment(Base):
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
     )
 
-    invention: Mapped["Invention"] = relationship(back_populates="experiments")
+    invention: Mapped["Invention"] = relationship(
+        back_populates="experiments", foreign_keys=[invention_id]
+    )
     attachments: Mapped[list["Attachment"]] = relationship(back_populates="experiment")
 
 

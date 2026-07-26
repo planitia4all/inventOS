@@ -35,10 +35,18 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "is_favorite": "BOOLEAN DEFAULT 0",
         "parent_invention_id": "VARCHAR(36)",
         "owner_id": "VARCHAR(100)",
+        "derivation_reason": "VARCHAR(200)",
+        "source_experiment_id": "VARCHAR(36)",
     },
     "attachments": {
         "experiment_id": "VARCHAR(36)",
         "category": "VARCHAR(30) DEFAULT '기타'",
+    },
+    "invention_ai_results": {
+        "model": "VARCHAR(100)",
+        "input_snapshot": "TEXT",
+        "applied_fields": "JSON",
+        "status": "VARCHAR(20) DEFAULT '생성됨'",
     },
 }
 
@@ -52,6 +60,7 @@ def run_migrations(engine: Engine) -> list[str]:
     applied = _add_missing_columns(engine)
     _remap_legacy_status_values(engine)
     _backfill_tags_from_keywords(engine)
+    _backfill_ai_result_status(engine)
     _ensure_search_index(engine)
     return applied
 
@@ -133,6 +142,36 @@ def _backfill_tags_from_keywords(engine: Engine) -> None:
                 continue
             TagService(session).add_tags(invention.id, raw_keywords)
         session.commit()
+    finally:
+        session.close()
+
+
+def _backfill_ai_result_status(engine: Engine) -> None:
+    """예전 InventionAIResult 행에 status/applied_fields를 채워 넣는다.
+
+    이 컬럼들이 생기기 전에 만들어진 행은 status가 NULL이거나(구버전 ALTER
+    직후) applied_fields가 비어 있을 수 있다. 여러 번 실행해도 안전하도록
+    이미 채워진 행은 건드리지 않는다.
+    """
+    inspector = inspect(engine)
+    if "invention_ai_results" not in set(inspector.get_table_names()):
+        return
+
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    session: Session = session_factory()
+    try:
+        from src.database.models import InventionAIResult
+
+        changed = False
+        for result in session.scalars(select(InventionAIResult)):
+            if not result.status:
+                result.status = "반영됨" if result.applied_at else "생성됨"
+                changed = True
+            if not result.applied_fields and result.applied_to_field:
+                result.applied_fields = [result.applied_to_field]
+                changed = True
+        if changed:
+            session.commit()
     finally:
         session.close()
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 
 from src.ai.base import PatentComparisonDraft, SearchTerms
+from src.ai.review import PROMPT_INSTRUCTIONS, REVIEW_KIND_LABELS
 from src.database.models import Invention, PatentDocument
 
 _STOPWORDS = {"the", "a", "an", "of", "and", "or", "to", "for", "is", "with", "in", "on"}
@@ -75,4 +76,15 @@ class MockAIProvider:
             technical_risks=[],
             additional_search_terms=[],
             confidence=0,
+        )
+
+    def review_invention(self, invention: Invention, kind: str) -> str:
+        label = REVIEW_KIND_LABELS.get(kind, kind)
+        instruction = PROMPT_INSTRUCTIONS.get(kind, "")
+        base_text = (invention.original_idea or invention.title or "").strip()
+        snippet = base_text[:80] + ("..." if len(base_text) > 80 else "")
+        return (
+            f"[Mock {label}]\n{instruction}\n\n"
+            f"원본 요약: {snippet}\n"
+            "(실제 AI Provider를 설정하면 더 구체적인 결과를 받을 수 있습니다.)"
         )

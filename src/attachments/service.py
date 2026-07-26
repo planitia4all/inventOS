@@ -100,6 +100,23 @@ class AttachmentService:
         SearchIndexService(self.session).reindex_invention(invention_id)
         return attachment
 
+    def copy_to_invention(self, attachment: Attachment, target_invention_id: str) -> Attachment:
+        """첨부파일 실물을 복사해 다른 발명(주로 파생 아이디어)에 붙인다.
+
+        기존 `save()`를 그대로 재사용한다 — 파일을 먼저 쓰고 성공했을 때만
+        DB 행을 만들기 때문에, 복사 도중 실패해도 파일 없는 DB 행이나 DB
+        행 없는 파일이 새로 생기지 않는다.
+        """
+        source_path = self.resolve_path(attachment)
+        content = source_path.read_bytes()
+        return self.save(
+            target_invention_id,
+            attachment.original_filename,
+            content,
+            content_type=attachment.content_type,
+            category=attachment.category,
+        )
+
     def list_for_invention(self, invention_id: str) -> list[Attachment]:
         return list(
             self.session.query(Attachment)
