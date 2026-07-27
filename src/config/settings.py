@@ -21,9 +21,24 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 load_dotenv(_PROJECT_ROOT / ".env")
 
-# 설정 화면 "앱 정보"에 표시하는 버전. 사용자에게 보여주는 용도일 뿐 자동
-# 업데이트 체크 등에는 쓰지 않는다.
-APP_VERSION = "0.4.0"
+def _load_app_version() -> str:
+    """프로젝트 루트의 `VERSION` 파일을 유일한 버전 원본으로 삼는다.
+
+    설정 화면/README/기타 어디서든 버전을 표시할 때 이 값 하나만 바꾸면
+    되게 하기 위함이다. 파일이 없거나 읽지 못해도(예: 배포 방식에 따라
+    누락) 앱이 죽으면 안 되므로 안전한 기본값으로 대체한다.
+    """
+    try:
+        return (_PROJECT_ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        logger.warning("VERSION 파일을 읽지 못해 기본값을 사용합니다: %s", exc)
+        return "0.4.0-rc.1"
+
+
+# 설정 화면 "앱 정보"/README에 표시하는 버전. 사용자에게 보여주는 용도일 뿐
+# 자동 업데이트 체크 등에는 쓰지 않는다. 실제 값은 `VERSION` 파일 하나에서만
+# 관리한다 — "-rc.N"은 아직 실사용(UAT) 검증 전이라는 뜻이다.
+APP_VERSION = _load_app_version()
 
 # 현재 코드가 실제로 만들 수 있는 AI Provider. "openai"는 .env/설정 화면에
 # 자리는 마련해 두었지만 아직 구현하지 않았다 — src/ai/providers/factory.py가

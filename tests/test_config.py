@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.config.settings import Settings, _safe_int
+from src.config.settings import APP_VERSION, Settings, _load_app_version, _safe_int
 from src.database.engine import DataDirectoryError, init_engine
 
 
@@ -48,3 +48,22 @@ def test_init_engine_raises_clear_error_when_data_dir_unwritable(tmp_path):
 
     with pytest.raises(DataDirectoryError, match="데이터 저장 경로"):
         init_engine(settings)
+
+
+def test_app_version_matches_version_file():
+    from pathlib import Path
+
+    project_root = Path(__file__).resolve().parents[1]
+    file_value = (project_root / "VERSION").read_text(encoding="utf-8").strip()
+    assert APP_VERSION == file_value
+
+
+def test_app_version_is_marked_as_release_candidate():
+    assert "-rc." in APP_VERSION
+
+
+def test_load_app_version_falls_back_when_file_missing(tmp_path, monkeypatch):
+    import src.config.settings as settings_module
+
+    monkeypatch.setattr(settings_module, "_PROJECT_ROOT", tmp_path)
+    assert _load_app_version() == "0.4.0-rc.1"

@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 from sqlalchemy import create_engine, inspect, text
 
@@ -298,19 +300,50 @@ def test_migration_backup_is_only_created_once_across_repeated_runs(tmp_path):
 def test_migration_aborts_when_backup_fails_on_existing_db(tmp_path, monkeypatch):
     """기존 데이터가 있는 DB인데 백업이 실패하면(디스크 꽉 참 등), 안전망 없이
     스키마를 바꾸지 않고 마이그레이션 자체를 중단해야 한다."""
-    import shutil
+    import src.database.migrations as migrations_module
 
     engine = _old_db(tmp_path)
 
-    def failing_copy(*args, **kwargs):
-        raise OSError("디스크 공간 부족(시뮬레이션)")
-
-    monkeypatch.setattr(shutil, "copy2", failing_copy)
+    monkeypatch.setattr(migrations_module, "backup_to_file", lambda db_path, dest_path: False)
 
     with pytest.raises(MigrationBackupError):
         run_migrations(engine)
 
     # 백업이 실패했으니 스키마도 바뀌지 않아야 한다 (컬럼이 추가되지 않음).
+    inspector = inspect(engine)
+    present = {col["name"] for col in inspector.get_columns("inventions")}
+    assert "refined_content" not in present
+
+
+def test_migration_uses_sqlite_backup_api_not_raw_file_copy(tmp_path):
+    """마이그레이션 백업이 원본 파일 바이트를 그대로 복사하는 게 아니라
+    SQLite 온라인 백업 API로 만들어졌는지 확인한다 — 백업본을 별도 커넥션
+    으로 열어 실제 쿼리가 되는지로 검증한다(단순 바이트 복사도 이 조건은
+    만족하지만, 최소한 "깨진 백업이 아님"을 보장한다)."""
+    engine = _old_db(tmp_path)
+
+    run_migrations(engine)
+
+    backups = list(tmp_path.glob("old_backup_*.db"))
+    assert len(backups) == 1
+    with sqlite3.connect(str(backups[0])) as conn:
+        row = conn.execute("PRAGMA integrity_check").fetchone()
+    assert row[0] == "ok"
+
+
+def test_migration_aborts_when_backup_integrity_check_fails(tmp_path, monkeypatch):
+    """백업 자체(파일 복사)는 성공했지만 무결성 검사에 실패하면(손상된
+    백업), 역시 마이그레이션을 중단하고 손상된 백업 파일을 지워야 한다."""
+    import src.database.migrations as migrations_module
+
+    engine = _old_db(tmp_path)
+    monkeypatch.setattr(migrations_module, "_verify_backup_integrity", lambda path: False)
+
+    with pytest.raises(MigrationBackupError, match="무결성"):
+        run_migrations(engine)
+
+    # 손상된 것으로 판단된 백업 파일은 남겨두지 않는다.
+    assert list(tmp_path.glob("old_backup_*.db")) == []
     inspector = inspect(engine)
     present = {col["name"] for col in inspector.get_columns("inventions")}
     assert "refined_content" not in present

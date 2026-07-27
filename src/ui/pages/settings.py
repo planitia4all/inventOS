@@ -90,6 +90,11 @@ def render() -> None:
     st.divider()
     st.subheader("앱 정보")
     st.caption(f"InventOS v{APP_VERSION}")
+    if "-rc." in APP_VERSION:
+        st.caption(
+            "이 버전은 Release Candidate입니다 — 기능 개발은 동결되었고, "
+            "실사용 테스트(UAT)에서 발견된 문제만 수정합니다."
+        )
     st.caption(
         "발명가를 위한 AI 운영체제 — 생각이 발전하는 과정을 기록하는 시스템입니다."
     )
