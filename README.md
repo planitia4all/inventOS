@@ -634,6 +634,15 @@ AI 검토 결과의 "삭제"는 이것과 또 다릅니다 — 발명처럼 휴�
 아직 구조조차 만들지 않았습니다 — 실제로 필요해지는 시점에 설계하는 편이
 과도한 설계를 피할 수 있다고 판단했습니다.
 
+### 설계만 해 둔 것 (코드 없음)
+
+- **Conversation Engine / Idea Evolution**:
+  ChatGPT/Claude와 나눈 대화를 붙여넣으면 발명노트로 변환하고, 이후
+  N차 대화를 같은 발명에 누적하며 아이디어의 진화 과정을 기록하는 기능.
+  설계 문서는 [`docs/conversation-engine-design.md`](docs/conversation-engine-design.md)에
+  있으며, **아직 구현하지 않았습니다.** `0.4.0` 정식 릴리스(UAT 완료) 이후
+  별도 `0.5.0-dev` 브랜치에서 착수 여부를 결정합니다.
+
 ## MVP 범위에서 제외된 기능
 
 React/Next.js·FastAPI 전환, 완전한 PWA(오프라인 동기화), 앱스토어 모바일
