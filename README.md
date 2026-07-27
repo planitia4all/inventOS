@@ -636,11 +636,12 @@ AI 검토 결과의 "삭제"는 이것과 또 다릅니다 — 발명처럼 휴�
 
 ### 설계만 해 둔 것 (코드 없음)
 
-- **AI 대화 가져오기 (Conversation Import)**:
-  ChatGPT/Claude와 나눈 대화를 붙여넣으면 발명노트로 자동 변환하는 기능.
-  설계 문서는 [`docs/conversation-import-design.md`](docs/conversation-import-design.md)에
+- **Conversation Engine / Idea Evolution**:
+  ChatGPT/Claude와 나눈 대화를 붙여넣으면 발명노트로 변환하고, 이후
+  N차 대화를 같은 발명에 누적하며 아이디어의 진화 과정을 기록하는 기능.
+  설계 문서는 [`docs/conversation-engine-design.md`](docs/conversation-engine-design.md)에
   있으며, **아직 구현하지 않았습니다.** `0.4.0` 정식 릴리스(UAT 완료) 이후
-  `0.5.0`에서 착수할 예정입니다.
+  별도 `0.5.0-dev` 브랜치에서 착수 여부를 결정합니다.
 
 ## MVP 범위에서 제외된 기능
 
