@@ -6,7 +6,7 @@ from pathlib import Path
 
 from sqlalchemy import create_engine
 
-from src.database.backup import create_consistent_snapshot
+from src.database.backup import backup_to_file, create_consistent_snapshot
 from src.database.models import Base, Invention
 
 
@@ -76,3 +76,23 @@ def test_snapshot_matches_original_row_count(tmp_path):
         snap_conn.close()
 
     assert snapshot_count == original_count == 3
+
+
+def test_backup_to_file_returns_false_when_db_missing(tmp_path):
+    assert backup_to_file(tmp_path / "no_such.db", tmp_path / "dest.db") is False
+
+
+def test_backup_to_file_creates_independently_openable_copy(tmp_path):
+    db_path = _make_db_with_inventions(tmp_path, count=4)
+    dest_path = tmp_path / "inventos_backup_20260101_000000.db"
+
+    ok = backup_to_file(db_path, dest_path)
+
+    assert ok is True
+    assert dest_path.exists()
+    conn = sqlite3.connect(str(dest_path))
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM inventions").fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 4

@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy import Engine, inspect, select, text
 from sqlalchemy.orm import Session, sessionmaker
+
+from src.database.backup import backup_to_file
 
 logger = logging.getLogger(__name__)
 
@@ -104,16 +106,36 @@ def _unique_backup_path(db_path: Path) -> Path:
     return candidate
 
 
+def _verify_backup_integrity(backup_path: Path) -> bool:
+    """백업 파일이 실제로 열리고 손상되지 않았는지 확인한다."""
+    try:
+        conn = sqlite3.connect(str(backup_path))
+        try:
+            row = conn.execute("PRAGMA integrity_check").fetchone()
+            return row is not None and row[0] == "ok"
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+
+
 def _backup_db_file(engine: Engine) -> Path | None:
-    """스키마를 바꾸기 전에 SQLite 파일을 통째로 복사해 둔다.
+    """스키마를 바꾸기 전에 SQLite의 온라인 백업 API로 일관된 백업을 만든다.
 
     새 DB(파일이 아직 없거나 비어 있음)나 in-memory DB에서는 아무 일도
     하지 않는다 — 백업할 기존 데이터가 없기 때문이다.
 
-    이미 데이터가 있는 기존 DB인데 백업 자체가 실패하면(디스크 꽉 참,
-    쓰기 권한 없음 등) 안전망 없이 스키마를 바꾸지 않는다 —
-    `MigrationBackupError`를 던져 마이그레이션 전체를 중단시킨다. 사용자가
-    원인을 해결하고 다시 실행하면 된다.
+    단순 파일 복사(`shutil.copy2`) 대신 `sqlite3.Connection.backup()`
+    (`src.database.backup.backup_to_file`)을 쓴다 — 설정 화면의 DB
+    다운로드 백업과 같은 방식으로 통일해, 앱이 이미 실행 중이거나 백업
+    시점에 다른 프로세스가 DB에 접근 중이어도 항상 일관된 스냅샷이
+    되도록 한다. 백업이 끝나면 `PRAGMA integrity_check`로 실제로 손상
+    없이 열리는 파일인지 확인한다.
+
+    이미 데이터가 있는 기존 DB인데 백업 자체(또는 무결성 확인)가
+    실패하면(디스크 꽉 참, 쓰기 권한 없음 등) 안전망 없이 스키마를
+    바꾸지 않는다 — `MigrationBackupError`를 던져 마이그레이션 전체를
+    중단시킨다. 사용자가 원인을 해결하고 다시 실행하면 된다.
     """
     url = engine.url
     if url.get_backend_name() != "sqlite" or not url.database:
@@ -123,13 +145,18 @@ def _backup_db_file(engine: Engine) -> Path | None:
         return None
 
     backup_path = _unique_backup_path(db_path)
-    try:
-        shutil.copy2(db_path, backup_path)
-    except OSError as exc:
+    if not backup_to_file(db_path, backup_path):
         raise MigrationBackupError(
-            "스키마 변경 전 데이터베이스 백업에 실패해 마이그레이션을 중단했습니다. "
-            f"디스크 공간이나 쓰기 권한을 확인한 뒤 다시 실행해 주세요. (원인: {exc})"
-        ) from exc
+            "스키마 변경 전 데이터베이스 백업(SQLite 온라인 백업)에 실패해 "
+            "마이그레이션을 중단했습니다. 디스크 공간이나 쓰기 권한을 확인한 뒤 "
+            "다시 실행해 주세요."
+        )
+    if not _verify_backup_integrity(backup_path):
+        backup_path.unlink(missing_ok=True)
+        raise MigrationBackupError(
+            "스키마 변경 전 백업 파일의 무결성 검사에 실패해 마이그레이션을 "
+            "중단했습니다. 디스크 공간을 확인한 뒤 다시 실행해 주세요."
+        )
     logger.info("스키마 변경 전 DB를 백업했습니다: %s", backup_path)
     return backup_path
 
