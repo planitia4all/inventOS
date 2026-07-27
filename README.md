@@ -634,6 +634,14 @@ AI 검토 결과의 "삭제"는 이것과 또 다릅니다 — 발명처럼 휴�
 아직 구조조차 만들지 않았습니다 — 실제로 필요해지는 시점에 설계하는 편이
 과도한 설계를 피할 수 있다고 판단했습니다.
 
+### 설계만 해 둔 것 (코드 없음)
+
+- **AI 대화 가져오기 (Conversation Import)**:
+  ChatGPT/Claude와 나눈 대화를 붙여넣으면 발명노트로 자동 변환하는 기능.
+  설계 문서는 [`docs/conversation-import-design.md`](docs/conversation-import-design.md)에
+  있으며, **아직 구현하지 않았습니다.** `0.4.0` 정식 릴리스(UAT 완료) 이후
+  `0.5.0`에서 착수할 예정입니다.
+
 ## MVP 범위에서 제외된 기능
 
 React/Next.js·FastAPI 전환, 완전한 PWA(오프라인 동기화), 앱스토어 모바일
