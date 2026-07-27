@@ -21,7 +21,12 @@
 | 10 | [키워드 정규화](#10-키워드-정규화) | 23 | [0.5.0 MVP 범위](#23-050-mvp-범위) |
 | 11 | [중요도 계산 방식](#11-중요도-계산-방식) | 24 | [후속 버전 범위](#24-후속-버전-범위) |
 | 12 | [Source Traceability](#12-source-traceability) | 25 | [예상 위험 및 대응](#25-예상-위험-및-대응) |
-| 13 | [Evolution Timeline](#13-evolution-timeline) | — | [부록: 파싱 파이프라인](#부록-파싱-파이프라인-mapreduce) |
+| 13 | [Evolution Timeline](#13-evolution-timeline) | 26 | [analysis_json 스키마 계약](#26-analysis_json-스키마-계약) |
+| — | — | 27 | [AI 분석과 사용자 판단 분리](#27-ai-분석과-사용자-판단-분리) |
+| — | — | — | [부록: 파싱 파이프라인](#부록-파싱-파이프라인-mapreduce) |
+
+> **§26·§27은 데이터 계약이다.** 구현 순서상 가장 먼저 고정해야 하는
+> 부분이므로, 코드를 쓰기 전에 이 두 절을 먼저 확정한다.
 
 ---
 
@@ -175,8 +180,7 @@ for exp in candidate.experiments:
     ExperimentService(s).create(inv.id, exp)
 for sig in candidate.signals:                  # Evolution Timeline
     TimelineService(s).log(inv.id, sig.event_type, meta={...})
-AttachmentService(s).save(inv.id, "conversation_001.md", raw_bytes)
-# + ConversationImport 레코드 1건 (§16)
+# + ConversationImport 레코드 1건 (raw_content 포함, §16.2)
 ```
 
 ---
@@ -265,8 +269,44 @@ N차 대화를 분석할 때 컨텍스트에 넣는 것:
 반영이 끝나면 누적 요약을 v(N)으로 갱신한다. **대화가 50개가 되어도
 컨텍스트 크기는 늘지 않는다.**
 
-누적 요약은 `InventionAIResult(kind="rolling_summary")` 한 건을
-갱신하며 유지한다.
+### 5.2.1 누적 요약은 원문을 대체하지 않는다
+
+누적 요약은 **AI 호출 비용을 줄이기 위한 파생물일 뿐**이다.
+각 대화 원문은 언제나 독립적으로 보존되며(§6), 요약이 잘못되었더라도
+원문에서 다시 만들 수 있어야 한다.
+
+### 5.2.2 요약 이력 보존
+
+누적 요약은 덮어쓰지 않고 **버전마다 새 레코드로 쌓는다.**
+`InventionAIResult(kind="rolling_summary")`를 매번 새로 만들고, 최신
+1건을 현재 요약으로 쓴다(기존 `status`로 이전 것을 `보관됨` 처리).
+
+각 요약 레코드가 `structured_content`에 남기는 것:
+
+```json
+{
+  "schema_version": "1.0",
+  "summary_version": 4,
+  "previous_summary": "...",
+  "summary": "...",
+  "previous_summary_hash": "sha256:...",
+  "source_conversation_id": "conv-uuid",
+  "source_raw_content_hash": "sha256:...",
+  "provider": "anthropic",
+  "model": "claude-sonnet-5",
+  "prompt_version": "rolling-summary-1.0",
+  "analysis_schema_version": "1.0",
+  "generated_at": "2026-08-10T12:00:00Z"
+}
+```
+
+**해시를 남기는 이유**: 나중에 요약이 이상하다고 판단됐을 때,
+"어느 요약 위에 어느 대화를 얹어서 만든 것인지"를 정확히 재현할 수
+있어야 한다. 해시가 없으면 재현이 불가능하다.
+
+`ConversationImport.rolling_summary_before` / `rolling_summary_after`
+(§16.2)가 이 레코드들을 가리켜, 대화별로 "이 대화가 요약을 어떻게
+바꿨는지"를 바로 볼 수 있다.
 
 ### 5.3 통합 분석
 
@@ -299,33 +339,93 @@ N차 대화를 분석할 때 컨텍스트에 넣는 것:
 ### 6.1 5계층 분리
 
 ```
-① 원본 대화        디스크 (.md 첨부파일)                절대 불변
-② AI 분석 결과     ConversationImport.analysis_json     불변 (재분석 시 새 레코드)
-③ 사용자 승인 내용  Invention 본문 필드                  가변
+① 원본 대화        ConversationImport.raw_content       절대 불변
+② AI 분석 결과     analysis_json.ai_analysis            재분석 시 교체
+③ 사용자 판단      analysis_json.user_review            재분석해도 보존 (§27)
 ④ 변경 전 스냅샷    InventionRevision                    불변
 ⑤ 변경 사건        InventionEvent                       불변
 ```
 
-### 6.2 원문 저장 위치: 디스크
+### 6.2 원문 저장 위치: DB 컬럼
 
-원문은 `AttachmentService.save()`로 `.md` 파일에 저장한다.
+원문은 `ConversationImport.raw_content` **컬럼에 직접 저장한다.**
 
-- 대화가 수백 KB여도 **DB가 부풀지 않는다**
-- 기존 전체 데이터 ZIP 백업에 자동 포함
-- 기존 첨부파일 무결성 검사 대상에 자동 포함
-- 파일명이 FTS 색인에 들어가 검색됨
+> **초기 설계에서 바뀐 결정이다.** 처음에는 `.md` 첨부파일(디스크)을
+> 제안했으나, 다음 이유로 DB 컬럼이 낫다고 판단했다.
 
-`ConversationImport.raw_attachment_id`가 이 파일을 가리킨다.
+| 항목 | DB 컬럼 | 디스크 첨부 |
+|---|---|---|
+| 저장 원자성 | ✅ 트랜잭션 하나 | ❌ 파일 성공 + DB 실패 시 고아 파일 |
+| 해시 기반 중복 검사 (§6.4) | ✅ `WHERE raw_content_hash = ?` | ⚠️ 파일을 다 읽어야 함 |
+| 백업 일관성 | ✅ DB 스냅샷에 포함 | ⚠️ DB와 파일이 따로 |
+| 무결성 관리 | ✅ 불필요 | ❌ 파일 없는 레코드 발생 가능 |
+| DB 크기 | ⚠️ 증가 | ✅ 영향 없음 |
 
-> **필요한 변경**: `ALLOWED_EXTENSIONS`에 `.md`, `.txt` 추가.
-> 현재는 png/jpg/jpeg/pdf/wav/mp3/m4a/ogg/webm/mp4/mov만 허용되어
-> 텍스트 파일이 막힌다.
+파일-DB 불일치라는 **버그 종류 자체가 사라지는 것**이 크기 증가보다
+중요하다. 이미 첨부파일에서 그 문제를 겪어 무결성 검사 도구를 만들어야
+했다(§0.4.0).
+
+**크기 계산**: 대화 평균 50KB × 발명당 20건 × 발명 100건 = 약 100MB.
+SQLite가 다루기에 전혀 문제없는 크기다. 다만 설정 화면의 DB 백업
+다운로드가 그만큼 커진다.
+
+> **재검토 기준**: DB가 500MB를 넘으면 `raw_content`를 zlib 압축해
+> `BLOB`으로 저장하는 것을 검토한다(텍스트라 보통 1/4로 줄어든다).
+> 0.5.0에서는 하지 않는다.
+
+`.md` 첨부파일로 저장하지 않으므로 **`ALLOWED_EXTENSIONS` 변경도
+불필요하다** — 앞선 설계에서 필요하다고 적었던 항목이 사라졌다.
 
 ### 6.3 재분석 가능성
 
 원문이 그대로 있으므로 나중에 더 좋은 모델로 **재분석**할 수 있다.
-재분석은 기존 `ConversationImport`를 수정하지 않고 새 레코드를 만든다
-(`reanalysis_of`로 원본을 가리킴). 원문 첨부파일은 공유한다.
+재분석은 기존 레코드를 수정하지 않고 새 `ConversationImport`를 만들며
+(`reanalysis_of`로 원본을 가리킴), `raw_content`와 해시는 복사한다.
+
+**재분석해도 사용자의 승인·수정·거절 기록은 이어받는다** — 방법은
+§27.3에 있다.
+
+### 6.4 원문 중복 Import 방지
+
+같은 대화를 실수로 두 번 붙여넣는 일은 흔하다. 그대로 두면 본문이
+같은 내용으로 두 번 오염된다.
+
+**정규화 후 SHA-256을 계산한다.**
+
+```python
+def normalize_for_hash(raw: str) -> str:
+    """해시 계산용 정규화. 표시용 원문(raw_content)은 건드리지 않는다."""
+    text = unicodedata.normalize("NFKC", raw)
+    text = _UI_NOISE.sub("", text)      # "Copy code", "복사", "ChatGPT said:" 등
+    text = re.sub(r"[ \t]+", " ", text)  # 공백 정규화
+    text = re.sub(r"\n{3,}", "\n\n", text)  # 줄바꿈 정규화
+    return text.strip()
+
+raw_content_hash = hashlib.sha256(
+    normalize_for_hash(raw).encode("utf-8")
+).hexdigest()
+```
+
+정규화는 **해시 계산에만** 쓴다. `raw_content`에는 사용자가 붙여넣은
+그대로를 저장한다 (원칙 1).
+
+**판정과 안내**
+
+| 상황 | 동작 |
+|---|---|
+| 같은 발명에 같은 해시 | ⚠️ 경고 + 기본 차단 (사용자가 명시적으로 강행 가능) |
+| 다른 발명에 같은 해시 | ⚠️ 안내 ("이 대화는 INV-2026-00007에 이미 등록됨") |
+| 해시는 다르지만 TF-IDF 유사도 ≥ 0.95 | ⚠️ 경고 (일부만 다시 복사한 경우) |
+
+```
+⚠️ 동일하거나 매우 유사한 대화가 이미 등록되어 있습니다.
+   대화 #3 — 2026-07-27 · 유사도 100%
+
+   [취소]   [그래도 새 대화로 추가]
+```
+
+**기본은 경고이고 차단이 아니다.** 사용자가 의도적으로 같은 대화를
+다시 넣는 경우(예: 다른 발명 관점에서 재분석)를 막지 않는다.
 
 ---
 
@@ -509,17 +609,102 @@ TGV / Through Glass Via / 유리 관통 비아 / 글라스 비아 / 유리 비�
 ### 10.2 3단계 정규화
 
 ```
-1단계  결정론적 정규화 (AI 불필요)
-       대소문자·공백·하이픈 통일, 전각/반각 통일,
-       내장 약어 사전 (TGV ↔ Through Glass Via)
-
-2단계  AI 병합 후보 제안
-       표기가 다르지만 같은 개념으로 보이는 쌍 + 신뢰도 + 근거 원문
-
-3단계  사용자 승인   ← 자동 병합하지 않음
+1단계  결정론적 정규화 (AI 불필요)      ← §10.4 한국어 처리
+2단계  AI 병합 후보 제안                 신뢰도 + 근거 원문 포함
+3단계  사용자 승인                       ← 자동 병합하지 않음
        ☑ 그래핀 실 + Graphene fiber → "그래핀 섬유"
        ☐ 전도성 섬유                 → 별개 유지
 ```
+
+### 10.4 한국어 정규화 — 형태소 분석기 없이
+
+**0.5.0-alpha에 형태소 분석기(KoNLPy/Mecab 등)를 넣지 않는다.**
+설치가 무겁고(Java/C 의존), Windows 설치 실패가 잦으며, "새 의존성
+최소화" 원칙에 어긋난다. 대신 아래 최소 규칙으로 시작한다.
+
+**1) 표기 통일**
+
+```python
+text = unicodedata.normalize("NFKC", text)   # 전각/반각
+text = text.lower()                          # 영문 대소문자
+text = re.sub(r"[-_·\s]+", "", text)         # 하이픈·중점·공백
+```
+
+**2) 조사 제거 (보수적)**
+
+```python
+_PARTICLES = ("으로써","으로서","에서는","에게서","으로","에서","까지",
+              "부터","에게","한테","이나","라도","보다","처럼","마다",
+              "은","는","이","가","을","를","의","에","와","과","도","만","로")
+
+def strip_particle(token: str) -> str:
+    """조사로 보이는 꼬리를 뗀다. 남는 어간이 2자 미만이면 원본 유지."""
+    for p in sorted(_PARTICLES, key=len, reverse=True):
+        if token.endswith(p) and len(token) - len(p) >= 2:
+            return token[: -len(p)]
+    return token
+```
+
+`len >= 2` 가드가 핵심이다. 이게 없으면 `정도` → `정`, `가능` → `가`
+같은 오작동이 난다.
+
+| 입력 | 결과 | 비고 |
+|---|---|---|
+| 그래핀은 | 그래핀 | ✅ |
+| 유리기판에서 | 유리기판 | ✅ |
+| 장력을 | 장력 | ✅ |
+| 정도 | 정도 | ✅ 가드가 막음 (2-1=1 < 2) |
+| 가능 | 가능 | ✅ 가드가 막음 |
+| 자동화 | 자동화 | ✅ 해당 조사 없음 |
+| 온도 | 온도 | ✅ 가드가 막음 |
+
+**한계를 인정한다**: `모델링` → `모델`(ㄹ 아님, 해당 없음)처럼 대부분
+안전하지만, `이론` → 앞에 `이`가 아니라 끝이 `론`이라 안전, `자료를`
+→ `자료` 정상. 다만 `노트` 같은 단어가 `노` + `트`로 오인될 일은 없다
+(조사 목록에 `트`가 없음). **오작동이 발견되면 조사 목록을 줄이는
+방향으로 조정한다** — 과하게 떼는 것보다 덜 떼는 편이 안전하다.
+
+**3) N-gram (보조 매칭)**
+
+한글은 어절 경계가 불규칙하므로, 병합 후보를 찾을 때 **문자 bigram
+자카드 유사도**를 보조로 쓴다.
+
+```
+"유리관통비아"  → {유리, 리관, 관통, 통비, 비아}
+"유리비아"      → {유리, 리비, 비아}
+자카드 = 2/6 = 0.33   → 병합 후보로 제안 (임계 0.3)
+```
+
+**4) 내장 약어 사전** (`src/conversations/abbreviations.py`)
+
+```python
+BUILTIN_ABBREVIATIONS = {
+    "tgv": ["throughglassvia", "유리관통비아", "글라스비아", "유리비아"],
+    "pcb": ["printedcircuitboard", "인쇄회로기판"],
+    ...
+}
+```
+
+프로젝트에 내장하고, 사용자가 추가할 수는 없다(오염 방지).
+
+**5) 사용자 동의어 사전**
+
+사용자가 승인한 병합은 **발명 단위**로 `idea_elements` JSON에 쌓인다.
+
+```json
+{"canonical": "그래핀 섬유",
+ "synonyms": ["그래핀실", "graphenefiber", "전도성섬유"],
+ "approved_at": "2026-08-10T...", "approved_by": "user"}
+```
+
+전역 사전(모든 발명 공유)은 `Tag.canonical_tag_id`가 생기는
+0.6.0으로 미룬다 (§17).
+
+**6) 사용자 직접 병합·분리**
+
+아이디어 지도 화면에서 언제든 개념을 합치거나 되돌릴 수 있다.
+**병합은 되돌릴 수 있어야 한다** — 원본 표기를 `synonyms`에 그대로
+보존하므로 분리 시 복원된다.
 
 **자동 병합하지 않는 이유**: "전도성 섬유"는 그래핀 섬유의 상위 개념일
 수도, 동의어일 수도 있다. 잘못 병합하면 되돌리기 어렵고, **특허 문서
@@ -566,16 +751,59 @@ importance = 100 × (
 
 가중치는 `src/conversations/scoring.py` 상수 한 곳에 두어 쉽게 튜닝한다.
 
-### 11.3 표시 — 점수만 보여주지 않는다
+### 11.3 설명 가능성 — 점수는 항상 분해해서 저장한다
+
+**종합 점수를 하나의 불투명한 숫자로 만들지 않는다.** 8개 원자값과
+가중 기여도를 **함께 저장**해서, UI가 언제든 근거를 펼쳐 볼 수 있게 한다.
+
+```python
+@dataclass
+class ImportanceBreakdown:
+    """중요도의 원자값과 기여도. 점수와 항상 함께 저장한다."""
+    # 사람이 바로 이해하는 원자값 (정규화 전)
+    mention_count: int          # 언급 횟수
+    conversation_count: int     # 서로 다른 대화 등장 수
+    first_seq: int              # 최초 등장 회차
+    last_seq: int               # 최근 등장 회차
+    user_mention_count: int     # 사용자 발언에서의 언급 수
+    decision_count: int         # 결정·변경에 연루된 횟수
+    experiment_count: int       # 관련 실험 수
+    attachment_count: int       # 관련 첨부 수
+
+    # 정규화값(0~1)과 가중 기여도 — 합이 곧 최종 점수
+    factors: dict[str, float]        # {"f": 0.82, "s": 0.50, ...}
+    contributions: dict[str, float]  # {"f": 12.3, "s": 7.5, ...}
+    total: int                       # 0~100
+    weights_version: str             # 가중치를 바꿔도 과거 점수를 해석 가능
+```
+
+`weights_version`을 함께 저장하는 이유: 가중치를 튜닝하면 과거에
+계산된 점수와 비교가 불가능해진다. 버전을 남기면 "이 점수는 v1
+가중치로 계산됨"을 알 수 있고, 필요하면 일괄 재계산할 수 있다.
+
+**화면**
 
 ```
-그래핀 섬유                            중요도 92
+그래핀 섬유                                        중요도 92
   언급 18회 · 대화 6개 · 최근 3일 전
-  사용자 강조 높음 · 실험 2 · 이미지 3
-  [근거 보기]
+  사용자 강조 높음 · 실험 2 · 이미지 3        [근거 보기 ▾]
+
+  ▾ 근거
+    언급 빈도        18회        0.82 × 0.15 = 12.3
+    대화 확산도      6/12개      0.50 × 0.15 =  7.5
+    지속성           #2~#11      0.83 × 0.10 =  8.3
+    최근성           1회차 전    0.79 × 0.15 = 11.9
+    사용자 강조      11/18       0.61 × 0.20 = 12.2
+    결정 영향도      4회         0.80 × 0.10 =  8.0
+    연결도           3           0.60 × 0.05 =  3.0
+    증거 보유        실험2+이미지3 1.00 × 0.10 = 10.0
+                                            ─────────
+                                              합계  73  ← 예시
+    (가중치 v1)
 ```
 
-점수만 보여주면 신뢰하기 어렵다. **왜 92인지 분해해서 보여준다.**
+원자값을 저장해 두면 **가중치만 바꿔서 즉시 재계산**할 수 있다 —
+원본 대화를 다시 분석할 필요가 없다.
 
 ---
 
@@ -586,14 +814,55 @@ importance = 100 × (
 ```python
 @dataclass
 class SourceRef:
-    kind: str                    # conversation | experiment | attachment | patent | manual
-    conversation_id: str = ""    # ConversationImport.id
-    sequence_no: int = 0         # 대화 #3
-    turn_index: int = -1         # 대화 내 몇 번째 발언
-    speaker: str = ""            # user | assistant
-    excerpt: str = ""            # 원문 발췌 (최대 200자)
-    ref_id: str = ""             # experiment_id / attachment_id / patent_id
+    kind: str                          # conversation | experiment | attachment | patent | manual
+
+    # --- 대화 출처 (kind == "conversation") ---
+    conversation_import_id: str = ""   # ConversationImport.id
+    sequence_no: int = 0               # 대화 #3
+    message_index: int = -1            # 대화 내 몇 번째 메시지 (= turn_index)
+    message_role: str = ""             # user | assistant | unknown
+    source_excerpt: str = ""           # 원문 발췌 (최대 200자)
+    source_start: int = -1             # raw_content 기준 시작 offset (-1 = 미상)
+    source_end: int = -1               # 〃 끝 offset
+    confidence: int = 0                # 0~100
+
+    # --- 그 밖의 출처 ---
+    ref_id: str = ""                   # experiment_id / attachment_id / patent_id
 ```
+
+### 12.1.1 문자 Offset을 얻는 방법 — AI에게 세게 하지 않는다
+
+LLM은 문자 위치를 세는 데 약하다. offset을 직접 물어보면 거의 틀린다.
+대신 **AI에게는 원문을 그대로 인용하게 하고, offset은 우리가 계산한다.**
+
+```python
+def locate(raw_content: str, message_start: int, excerpt: str) -> tuple[int, int]:
+    """excerpt를 원문에서 찾아 offset을 계산한다. 못 찾으면 (-1, -1)."""
+    idx = raw_content.find(excerpt, message_start)
+    if idx < 0:
+        idx = raw_content.find(excerpt)      # 메시지 밖에서 재시도
+    if idx < 0:
+        return (-1, -1)                       # AI가 표현을 바꿈
+    return (idx, idx + len(excerpt))
+```
+
+- 프롬프트에서 `excerpt`는 **원문 그대로 인용**하도록 강제한다(§19.2).
+- 찾으면 정확한 offset이 생긴다 — AI가 숫자를 세지 않았으므로 신뢰할 수 있다.
+- 못 찾으면 `(-1, -1)`로 두고 `excerpt`만 보존하며, 해당 항목의
+  `confidence`를 낮춘다(AI가 원문을 바꿔 인용했다는 신호이므로).
+
+### 12.1.2 MVP 최소 보장
+
+offset이 `-1`이어도 다음 4가지는 **항상** 제공한다.
+
+```
+대화 번호        sequence_no
+사용자 / AI      message_role
+메시지 번호      message_index
+원문 일부        source_excerpt
+```
+
+즉 offset은 **있으면 더 좋은 정보**이고, 없어도 출처 추적은 성립한다.
 
 ### 12.2 어디에 붙는가
 
@@ -820,34 +1089,72 @@ OCR·비전 분석은 범위 밖이다. **이미지와 아이디어 요소의 �
 class ConversationImport(Base):
     """붙여넣은 대화 한 건과 그 분석 결과.
 
-    원문 자체는 여기 없다 — Attachment(.md)에 있고 raw_attachment_id로
-    가리킨다. 이 테이블은 '어떤 대화가 언제 어느 발명에 들어왔고
-    무엇을 바꿨는가'의 인덱스 역할만 한다.
+    검색·정렬·필터링에 쓰이는 값은 전부 정규 컬럼이다.
+    analysis_json에는 '조회 축이 아닌' 분석 내용만 들어간다 (§26).
     """
     __tablename__ = "conversation_imports"
 
-    id: str                        # uuid
-    invention_id: str              # FK → inventions.id, ondelete="CASCADE"
-    sequence_no: int               # 발명별 1,2,3...
-    source: str                    # chatgpt | claude | other
-    title: str
-    char_count: int
-    turn_count: int
-    conversation_date: date | None # 실제 대화일 (사용자 입력)
-    imported_at: datetime
-    raw_attachment_id: str | None  # FK → attachments.id (원문 .md)
-    analysis_json: dict | None     # 신호·요소·질문·변화 제안 전부
-    status: str                    # 분석됨 | 일부반영 | 반영완료 | 보관됨
-    revision_id: str | None        # FK → invention_revisions.id
-    reanalysis_of: str | None      # 재분석이면 원본 import id
-    provider: str
-    model: str | None
+    # --- 식별 / 소속 ---
+    id:                str            # uuid
+    invention_id:      str            # FK → inventions.id, ondelete="CASCADE"
+    sequence_no:       int            # 발명별 1,2,3...  (invention_id, sequence_no) UNIQUE
+
+    # --- 출처 ---
+    title:             str
+    source_type:       str            # chatgpt | claude | other | file
+    source_name:       str | None     # 파일명 등 (붙여넣기면 None)
+    conversation_date: date | None    # 실제 대화일 (사용자 입력)
+    imported_at:       datetime
+
+    # --- 원문 (§6.2) ---
+    raw_content:       str            # 사용자가 붙여넣은 그대로. 불변.
+    raw_content_hash:  str            # 정규화 후 SHA-256 (§6.4). INDEX
+    char_count:        int
+    turn_count:        int
+
+    # --- 분석 ---
+    analysis_status:   str            # 대기 | 분석중 | 분석됨 | 분석실패
+                                      # | 일부반영 | 반영완료 | 보관됨
+    analysis_json:     dict | None    # §26 스키마
+    analysis_schema_version: str      # "1.0"
+    provider:          str            # mock | anthropic
+    model:             str | None
+    prompt_version:    str            # "conversation-analysis-1.0"
+
+    # --- 누적 요약 연결 (§5.2.2) ---
+    rolling_summary_before: str | None  # FK → invention_ai_results.id
+    rolling_summary_after:  str | None  # 〃
+
+    # --- 반영 결과 ---
+    applied_at:        datetime | None
+    created_revision_id: str | None   # FK → invention_revisions.id
+    created_event_id:  str | None     # 대표 Timeline 이벤트 (나머지는 meta 역참조)
+
+    # --- 재분석 ---
+    reanalysis_of:     str | None     # 재분석이면 원본 import id
+
+    created_at:        datetime
+    updated_at:        datetime
 ```
 
-**이 테이블 하나가 필요한 이유**: 대화 목록·회차 정렬·반영 상태 조회가
-기본 기능인데, 이걸 `InventionAIResult`의 JSON 안에 넣으면 **목록
-화면조차 JSON 파싱으로** 만들어야 한다. 반면 요소·질문·변화 같은
-**분석 결과는 조회 축이 아니므로** JSON으로 충분하다.
+**필수 정규 컬럼** (이것만은 JSON에 넣지 않는다):
+`invention_id` · `sequence_no` · `raw_content` · `raw_content_hash` ·
+`analysis_status` · `analysis_schema_version` · `provider` / `model` ·
+`created_at` · `applied_at`
+
+**인덱스**
+
+| 인덱스 | 용도 |
+|---|---|
+| `(invention_id, sequence_no)` UNIQUE | 회차 정렬 + 중복 회차 방지 |
+| `raw_content_hash` | 중복 Import 검사 (§6.4) |
+| `(invention_id, analysis_status)` | "미반영 대화 있음" 배지 |
+
+**이 테이블 하나가 필요한 이유**: 대화 목록·회차 정렬·반영 상태 조회·
+중복 해시 검사가 전부 기본 기능인데, 이걸 `InventionAIResult`의 JSON
+안에 넣으면 **목록 화면조차 JSON 파싱으로** 만들어야 하고 해시 검사에
+전체 스캔이 필요하다. 반면 요소·질문·변화 같은 **분석 내용은 조회 축이
+아니므로** JSON으로 충분하다.
 
 ### 16.3 새 컬럼 2개 (권장, 없어도 동작)
 
@@ -863,7 +1170,7 @@ class ConversationImport(Base):
 
 | 요구사항 | 재사용 대상 | 신규 |
 |---|---|---|
-| 원문 보존 | `Attachment` (.md) | — |
+| 원문 보존 | — | `ConversationImport.raw_content` (§6.2) |
 | AI 분석 결과 | `ConversationImport.analysis_json` | 테이블 1 |
 | 변경 전 스냅샷 | `InventionRevision` | — |
 | 변경 사건 | `InventionEvent` + `meta.layer` | — |
@@ -907,8 +1214,11 @@ class ConversationImport(Base):
 
 ```
 src/conversations/
-├─ schemas.py     Conversation, Turn, Signal, SourceRef,
-│                 ChangeProposal, IdeaElement, Question, ImportPlan
+├─ schemas.py          Conversation, Turn, Signal, SourceRef,
+│                      ChangeProposal, IdeaElement, Question, ImportPlan
+├─ analysis_schema.py  ★ analysis_json 스키마 계약 + 접근자 + 마이그레이션 (§26)
+│                        — JSON 키 문자열이 존재하는 유일한 파일
+├─ hashing.py          원문 정규화 + SHA-256 + item_id 생성 (§6.4, §27.2)
 ├─ adapters.py    입력 형식별 → Conversation (§18.3)
 ├─ chunking.py    턴 단위 청크 분할
 ├─ parser.py      map/reduce 오케스트레이션 → ImportPlan
@@ -949,8 +1259,10 @@ Repository → DB
 | `src/ai/providers/anthropic_provider.py` | 실제 구현 |
 | `src/timeline/service.py` | `EVENT_LABELS` 항목 추가 |
 | `src/similarity/tfidf.py` | 범용 `calculate_text_similarity(a, b)` 추가 |
-| `src/attachments/service.py` | `ALLOWED_EXTENSIONS`에 `.md`, `.txt` |
 | `app.py` | 라우트 1개 |
+
+> `ALLOWED_EXTENSIONS` 변경은 **불필요해졌다** — 원문을 첨부파일이
+> 아니라 DB 컬럼에 저장하기로 했기 때문이다 (§6.2).
 
 ### 18.3 어댑터 — 입력은 여러 개, Parser는 하나
 
@@ -1298,7 +1610,7 @@ Provider: anthropic / claude-sonnet-5
 ```
 ✅ 대화 #4를 반영했습니다.
    본문 6개 항목 변경 · Revision #7 생성 · Timeline 9건 추가
-   원문은 conversation_004.md 로 보존되었습니다.
+   원문은 대화 #4 레코드에 그대로 보존되었습니다.  [원문 보기]
 
    [발명 내용 보기]  [아이디어 지도 보기]
 ```
@@ -1343,8 +1655,10 @@ Provider: anthropic / claude-sonnet-5
 | `attachments.notes` | nullable 컬럼 | 없음 — 기존 `_ADDED_COLUMNS` 메커니즘 |
 | `inventions.idea_candidates` | nullable JSON | 없음 — 〃 |
 | `EVENT_LABELS` 항목 | 표시용 dict | 없음 — 스키마 아님 |
-| `ALLOWED_EXTENSIONS` 확장 | 상수 | 없음 |
 | `calculate_text_similarity()` | 함수 추가 | 낮음 — 기존 함수가 이걸 호출하도록 정리 |
+
+> DB 크기가 늘어난다(원문을 컬럼에 저장, §6.2). 기존 데이터에는
+> 영향이 없고 새 대화를 넣을 때만 증가한다.
 
 ### 21.2 이 프로젝트에서 테이블 추가가 안전한 이유
 
@@ -1442,6 +1756,48 @@ test_conversation_service.py          ← DB
 test_conversation_traceability.py
   ChangeProposal의 sources가 반영 후 Timeline meta에 보존
   필드별 출처 역조회 정확성
+  excerpt가 원문에 있으면 offset이 정확히 계산됨
+  excerpt를 못 찾으면 offset -1 + confidence 하향 (예외 아님)
+  offset이 -1이어도 대화번호/역할/메시지번호/원문일부는 항상 존재
+
+test_analysis_schema.py               ← §26, 가장 먼저 작성
+  빈 dict / None을 load해도 예외 없이 기본 구조가 나옴
+  과거 버전(schema_version 없음) JSON도 현재 구조로 승격됨
+  미래 버전 JSON은 예외 없이 _unmigrated_raw에 원본 보존
+  필드가 없는 JSON을 읽어도 KeyError가 나지 않음
+  to_json() → load() 왕복이 손실 없음
+  마이그레이션 체인에 순환이 있으면 무한루프에 빠지지 않음
+  JSON 키가 analysis_schema.py 밖에서 참조되지 않음 (grep 테스트, §26.6)
+
+test_analysis_user_review.py          ← §27, 핵심
+  approve/reject/edit가 user_review에만 기록됨 (ai_analysis 불변)
+  재분석 시 ai_analysis만 교체되고 user_review는 보존
+  같은 내용이면 item_id가 동일 → 이전 판단을 이어받음
+  텍스트가 바뀌면 item_id가 달라짐 → 새 판단 대상
+  재분석 결과에 없는 이전 판단은 orphaned로 이동 (삭제 아님)
+  승인했지만 중복으로 반영되지 않은 항목이 구분됨
+  application_result가 실제 반영된 것만 담음
+
+test_conversation_hashing.py          ← §6.4
+  공백/줄바꿈만 다른 대화는 같은 해시
+  UI 문구("Copy code" 등)만 다른 대화는 같은 해시
+  내용이 다르면 다른 해시
+  정규화는 해시에만 적용되고 raw_content는 원본 그대로
+  같은 발명에 같은 해시 → 경고 (차단 아님)
+  강행 선택 시 정상 저장됨
+
+test_korean_normalization.py          ← §10.4
+  조사 제거: 그래핀은→그래핀, 유리기판에서→유리기판
+  2자 가드: 정도→정도, 가능→가능, 온도→온도 (잘못 떼지 않음)
+  전각/반각, 대소문자, 하이픈 통일
+  내장 약어 사전 (TGV ↔ Through Glass Via ↔ 유리관통비아)
+  bigram 자카드 유사도 임계값
+  사용자 병합 승인 후 synonyms에 원본 표기가 보존됨 (분리 가능)
+
+test_importance_scoring.py            ← §11.3
+  ImportanceBreakdown의 contributions 합 == total
+  원자값만으로 가중치를 바꿔 재계산 가능
+  weights_version이 함께 저장됨
 ```
 
 ### 22.3 E2E
@@ -1462,9 +1818,10 @@ tests/e2e/test_conversation_engine_flow.py
 특히 다음이 기존 동작을 깨지 않는지 확인:
 
 - `calculate_similarity()` 리팩터링
-- `ALLOWED_EXTENSIONS` 확장 (기존 확장자 거부 로직 유지)
 - `st.tabs` 도입 후 기존 상세 화면 E2E 셀렉터
 - 새 테이블 추가 후 기존 마이그레이션 테스트
+- 새 컬럼(`attachments.notes`, `inventions.idea_candidates`) 추가 후
+  기존 백업/무결성 검사 테스트
 
 ### 22.5 AI 응답 픽스처
 
@@ -1484,7 +1841,38 @@ tests/fixtures/conversations/
 
 ## 23. 0.5.0 MVP 범위
 
-### 23.1 반드시 구현
+### 23.0 0.5.0-alpha — 첫 릴리스 목표 (이 흐름까지만 완결)
+
+alpha는 **아래 한 줄 흐름이 끝까지 동작하는 것**만 목표로 한다.
+여기서 멈추고 실사용 피드백을 받은 뒤 나머지를 붙인다.
+
+```
+대화 붙여넣기
+  → 원문 저장 (raw_content + hash, 중복 경고)
+  → 발명 선택 (신규 / 현재 / 파생 / 다른 발명)
+  → 분석 (map/reduce)
+  → 기존 내용과 비교
+  → 신규·구체화·중복·충돌 분류
+  → 사용자 항목별 승인
+  → Revision 생성
+  → 본문 반영
+  → Timeline 기록 (layer=idea)
+  → 대화 목록 및 회차 표시
+```
+
+**alpha의 인포그래픽은 6개뿐이다.**
+
+- 총 대화 수
+- 상위 개념 (중요도 순 목록)
+- 최근 새 개념
+- 미해결 질문
+- 대화별 변화 요약 (새 개념 N · 수정 N · 중복 N)
+- 간단한 막대그래프 (`st.bar_chart` 1개)
+
+**alpha에서 하지 않는 것**: 관계도, 자동 이미지 분석, 발전 타임라인
+시각화(데이터는 쌓되 화면은 뒤로), 후보 방법 상태 관리 UI, 성숙도 별점.
+
+### 23.1 0.5.0 정식 — 반드시 구현
 
 | # | 항목 | 근거 |
 |---|---|---|
@@ -1531,6 +1919,7 @@ tests/fixtures/conversations/
 
 | 단계 | 내용 | 이 단계에서 되는 것 |
 |---|---|---|
+| **0** | **`analysis_schema.py` + `hashing.py` (§26, §27)** | **데이터 계약이 고정된다 — 코드보다 먼저** |
 | 1 | schemas + PasteAdapter + chunking | 대화를 턴·청크로 쪼갠다 (AI 없음) |
 | 2 | dedup + scoring + elements 정규화 | 중복·중요도가 AI 없이 계산된다 |
 | 3 | Mock Provider 3개 메서드 | 키 없이 파이프라인이 끝까지 돈다 |
@@ -1631,14 +2020,40 @@ AI가 `deprecated`로 잘못 판정한 것을 승인하면 본문이 지워진�
 - 사용자 승인이 최종 방어선
 - 본문이 길어지면 "정리하기" 안내
 
-### R5. `analysis_json` 비대화
+### R5. DB 크기 증가 (`raw_content` + `analysis_json`)
 
-대화 20개 × 요소 200개면 JSON이 커진다.
+원문을 DB 컬럼에 넣기로 했고(§6.2), 대화 20개 × 요소 200개면
+`analysis_json`도 커진다.
 
 **대응**
-- 원문은 디스크, JSON은 **요약·참조만** (excerpt 200자 제한)
+- `analysis_json`은 **요약·참조만** 담는다 (excerpt 200자 제한).
+  원문 전체를 JSON에 중복 저장하지 않는다 — 원문은 `raw_content`에만 있다.
 - 대화당 JSON 상한 목표 100KB
-- 초과하면 §17 테이블 승격 신호로 본다
+- 예상 DB 크기: 대화 50KB × 20건 × 발명 100건 ≈ 100MB (SQLite 무리 없음)
+- **재검토 기준**: DB 500MB 초과 시 `raw_content` zlib 압축 검토 (§6.2),
+  `analysis_json` 비대화 시 §17 테이블 승격 신호로 본다
+
+### R11. 스키마 계약이 지켜지지 않고 무너짐
+
+`analysis_json`을 자유 형식으로 쓰기 시작하면 6개월 뒤 구조를 알 수
+없게 되고, 테이블 승격(§17)도 불가능해진다.
+
+**대응**
+- 접근자 계층 강제 (§26.4) — JSON 키는 `analysis_schema.py`에만 존재
+- **grep 테스트로 위반을 자동 검출** (§26.6)
+- 필드 삭제 금지, 추가만 (§26.1)
+- 구현 순서에서 **0단계**로 못 박음 (§23.4) — 코드보다 먼저 확정
+
+### R12. 재분석이 사용자 판단을 지움
+
+이게 깨지면 **재분석 기능 자체를 아무도 쓰지 않는다.** 대화 12개짜리
+발명에서 예전에 거절한 제안 40개를 매번 다시 검토할 수는 없다.
+
+**대응**
+- `ai_analysis` / `user_review` / `application_result` 3계층 분리 (§27.1)
+- 내용 기반 `item_id`로 재분석을 견디는 식별자 확보 (§27.2)
+- 재분석 결과에 없는 판단도 `orphaned_decisions`로 보관 (삭제 금지)
+- `test_analysis_user_review.py`로 회귀 고정 (§22.2)
 
 ### R6. Streamlit 동기 실행으로 UI가 멈춤
 
@@ -1684,6 +2099,308 @@ AI가 `deprecated`로 잘못 판정한 것을 승인하면 본문이 지워진�
 - 1~6단계(Mock 기반 완결 흐름)를 **먼저 0.5.0-alpha로 내보내** 실사용
   피드백을 받고, 7~10단계를 그 뒤에 붙인다
 - 각 단계마다 전체 테스트 통과를 강제한다
+
+---
+
+## 26. analysis_json 스키마 계약
+
+> `analysis_json`을 **자유 형식 JSON으로 쓰지 않는다.** JSON을 단순
+> 저장소로 쓰면 필드가 조금씩 늘고 이름이 흔들리다가, 1년 뒤에는
+> 어느 키가 언제 생겼는지 아무도 모르는 상태가 된다. 테이블을 나중에
+> 만들 수 있는 것도 **지금 스키마가 정확할 때만** 가능하다.
+
+### 26.1 세 가지 절대 규칙
+
+1. **JSON 키 문자열은 `analysis_schema.py` 밖에 등장하지 않는다.**
+   UI와 서비스는 접근자 메서드만 쓴다 (§26.4). 테스트로 강제한다 (§26.6).
+2. **필드를 삭제하지 않는다.** 추가만 한다. 쓰지 않게 된 필드는
+   `deprecated`로 표시하고 읽기는 계속 지원한다.
+3. **읽을 때 없는 필드는 기본값으로 채운다.** 과거 버전 JSON이
+   들어와도 절대 `KeyError`가 나지 않는다.
+
+### 26.2 최상위 구조
+
+```json
+{
+  "schema_version": "1.0",
+  "analysis_version": 1,
+  "provider": "mock",
+  "model": null,
+  "prompt_version": "conversation-analysis-1.0",
+  "analyzed_at": "2026-08-10T12:00:00Z",
+
+  "ai_analysis": {
+    "new_elements":         [],
+    "reinforced_elements":  [],
+    "modified_elements":    [],
+    "conflicting_elements": [],
+    "rejected_elements":    [],
+    "open_questions":       [],
+    "source_references":    [],
+    "merge_proposals":      []
+  },
+
+  "user_review": {
+    "decisions": [],
+    "edits":     [],
+    "notes":     ""
+  },
+
+  "application_result": {
+    "applied_items": [],
+    "revision_id":   null,
+    "event_ids":     [],
+    "applied_at":    null
+  }
+}
+```
+
+3계층으로 나눈 이유는 §27에 있다 — 요약하면 **재분석 시
+`ai_analysis`만 교체되고 `user_review`는 살아남아야 하기 때문**이다.
+
+| 최상위 키 | 의미 | 재분석 시 |
+|---|---|---|
+| `schema_version` | 이 JSON의 구조 버전 | 최신으로 갱신 |
+| `analysis_version` | 이 대화를 몇 번째로 분석했는가 | +1 |
+| `provider` / `model` / `prompt_version` | 무엇으로 분석했는가 | 갱신 |
+| `ai_analysis` | AI가 만든 것 | **통째로 교체** |
+| `user_review` | 사람이 판단한 것 | **보존 + 이어받기** |
+| `application_result` | 실제 반영 결과 | 보존 (새 반영 시 추가) |
+
+### 26.3 항목의 공통 형태
+
+`ai_analysis`의 모든 배열 원소는 같은 뼈대를 갖는다.
+
+```json
+{
+  "item_id": "a3f2c8d1e5b70942",
+  "kind": "tech",
+  "text": "그래핀 섬유를 장력 상태로 관통 배치",
+  "target_field": "core_principle",
+  "confidence": 94,
+  "rationale": "사용자가 대화 #4에서 반복해서 강조",
+  "sources": [
+    {
+      "conversation_import_id": "conv-uuid",
+      "sequence_no": 4,
+      "message_index": 12,
+      "message_role": "user",
+      "source_excerpt": "그래핀 실을 그대로 당긴 채로...",
+      "source_start": 18422,
+      "source_end": 18461,
+      "confidence": 94
+    }
+  ]
+}
+```
+
+### 26.4 접근자 계층
+
+```python
+# src/conversations/analysis_schema.py
+
+CURRENT_SCHEMA_VERSION = "1.0"
+CURRENT_PROMPT_VERSION = "conversation-analysis-1.0"
+
+
+class AnalysisDocument:
+    """analysis_json에 접근하는 유일한 경로.
+
+    UI와 서비스는 JSON 키 문자열을 직접 쓰지 않는다 — 전부 이 클래스의
+    메서드를 거친다. 스키마가 바뀌어도 고칠 곳은 이 파일 하나다.
+    """
+
+    @classmethod
+    def load(cls, raw: dict | None) -> "AnalysisDocument":
+        """어떤 버전으로 저장됐든 현재 구조로 올려서 돌려준다."""
+        return cls(_upgrade(raw or _empty()))
+
+    def to_json(self) -> dict: ...
+
+    # 읽기 --------------------------------------------------
+    def new_elements(self) -> list[AnalysisItem]: ...
+    def modified_elements(self) -> list[AnalysisItem]: ...
+    def conflicting_elements(self) -> list[AnalysisItem]: ...
+    def open_questions(self) -> list[Question]: ...
+    def merge_proposals(self) -> list[MergeProposal]: ...
+    def pending_items(self) -> list[AnalysisItem]:
+        """아직 사용자가 판단하지 않은 항목만."""
+
+    # 사용자 판단 (§27) --------------------------------------
+    def approve(self, item_id: str, *, edited_text: str | None = None) -> None: ...
+    def reject(self, item_id: str, *, reason: str = "") -> None: ...
+    def decision_of(self, item_id: str) -> Decision | None: ...
+
+    # 반영 결과 ----------------------------------------------
+    def record_application(self, applied_item_ids: list[str],
+                           revision_id: str, event_ids: list[str]) -> None: ...
+
+    # 재분석 -------------------------------------------------
+    def replace_ai_analysis(self, new_ai: dict) -> "AnalysisDocument":
+        """AI 결과만 갈아끼우고 사용자 판단은 이어받는다 (§27.3)."""
+```
+
+### 26.5 버전 마이그레이션 체인
+
+```python
+_MIGRATIONS: dict[str, Callable[[dict], dict]] = {
+    # "1.0": _migrate_1_0_to_1_1,     ← 다음 버전이 생기면 여기 추가
+}
+
+def _upgrade(raw: dict) -> dict:
+    version = raw.get("schema_version", "0.9")   # 버전이 없으면 최초 형식
+    seen = set()
+    while version != CURRENT_SCHEMA_VERSION:
+        if version in seen or version not in _MIGRATIONS:
+            # 알 수 없는 버전 — 실패하지 않고 빈 구조 + 원본 보관
+            logger.warning("알 수 없는 analysis_json 버전: %s", version)
+            return _wrap_unknown(raw)
+        seen.add(version)
+        raw = _MIGRATIONS[version](raw)
+        version = raw["schema_version"]
+    return raw
+```
+
+**알 수 없는 버전을 만나도 예외를 던지지 않는다.** 원본을
+`_unmigrated_raw`에 통째로 보관하고 빈 구조를 돌려준다 — 미래 버전으로
+저장된 DB를 구버전 앱에서 열어도 데이터가 사라지지 않는다.
+
+### 26.6 규칙을 테스트로 강제
+
+```python
+def test_analysis_json_keys_are_not_referenced_outside_schema_module():
+    """analysis_json의 키를 다른 파일에서 직접 문자열로 쓰지 않는다.
+
+    이 테스트가 깨지면 접근자 계층을 우회한 것이다 — 스키마를 바꿀 때
+    고쳐야 할 곳이 여기저기 흩어지기 시작한다는 신호다.
+    """
+    guarded = {"ai_analysis", "user_review", "application_result",
+               "new_elements", "reinforced_elements", "modified_elements",
+               "conflicting_elements", "rejected_elements",
+               "open_questions", "source_references", "merge_proposals"}
+    for path in Path("src").rglob("*.py"):
+        if path.name == "analysis_schema.py":
+            continue
+        text = path.read_text(encoding="utf-8")
+        for key in guarded:
+            assert f'"{key}"' not in text, f"{path}에서 {key}를 직접 참조"
+```
+
+---
+
+## 27. AI 분석과 사용자 판단 분리
+
+### 27.1 다섯 가지 상태를 구분한다
+
+| 상태 | 저장 위치 |
+|---|---|
+| AI가 추출한 내용 | `ai_analysis.*` |
+| 사용자가 **승인**한 내용 | `user_review.decisions[status="approved"]` |
+| 사용자가 **수정**한 내용 | `user_review.edits[]` |
+| 사용자가 **거절**한 내용 | `user_review.decisions[status="rejected"]` |
+| 실제 **본문에 반영**된 내용 | `application_result.applied_items[]` |
+
+**승인 ≠ 반영이다.** 사용자가 승인해도 (a) 중복으로 판정되어
+건너뛰거나, (b) 트랜잭션이 실패하거나, (c) 다른 항목과 충돌해
+보류될 수 있다. 그래서 `application_result`가 따로 있어야
+"내가 승인한 것이 실제로 들어갔는가"를 확인할 수 있다.
+
+```json
+"user_review": {
+  "decisions": [
+    {"item_id": "a3f2c8d1", "status": "approved",
+     "decided_at": "2026-08-10T12:05:00Z"},
+    {"item_id": "b7e1a409", "status": "rejected",
+     "reason": "이미 다른 방식으로 정리함",
+     "decided_at": "2026-08-10T12:06:00Z"}
+  ],
+  "edits": [
+    {"item_id": "c2d8f513",
+     "original_text": "레이저로 유리를 가공한다",
+     "edited_text": "펨토초 레이저로 유리를 개질한 뒤 식각한다",
+     "edited_at": "2026-08-10T12:07:00Z"}
+  ],
+  "notes": ""
+}
+```
+
+### 27.2 item_id — 재분석을 견디는 안정적 식별자
+
+사용자 판단을 보존하려면 **재분석해도 같은 제안이 같은 id를 가져야
+한다.** uuid를 새로 만들면 매번 다른 id가 되어 판단을 이어받을 수 없다.
+
+**내용 기반 해시로 만든다.**
+
+```python
+def make_item_id(change_type: str, target_field: str, text: str) -> str:
+    """같은 제안이면 언제 분석해도 같은 id가 나오도록 내용으로 만든다."""
+    normalized = re.sub(r"\s+", " ", text).strip().lower()
+    payload = f"{change_type}|{target_field}|{normalized}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+```
+
+`text`가 조금이라도 바뀌면 다른 id가 된다 — 이건 **의도된 동작**이다.
+AI가 다르게 표현했다면 그건 새로운 제안이므로 사용자가 다시 판단해야
+한다. 완전히 같은 문장일 때만 이전 판단을 이어받는다.
+
+### 27.3 재분석 병합 규칙
+
+```
+재분석 결과의 각 item_id에 대해:
+  이전 user_review에 같은 id의 판단이 있으면
+      → 그 판단을 그대로 이어받는다 (다시 묻지 않음)
+      → carried_over: true 로 표시
+  없으면
+      → 새 항목 (미판단 상태)
+
+이전 판단 중 재분석 결과에 없는 id:
+      → 삭제하지 않고 user_review.orphaned_decisions 로 옮겨 보관
+      → "이전 분석에만 있던 항목 3건" 으로 접어서 표시
+```
+
+```python
+def replace_ai_analysis(self, new_ai: dict) -> "AnalysisDocument":
+    """AI 결과만 갈아끼우고 사용자 판단은 이어받는다."""
+    new_ids = {item["item_id"] for item in _iter_items(new_ai)}
+    kept, orphaned = [], []
+    for d in self._doc["user_review"]["decisions"]:
+        (kept if d["item_id"] in new_ids else orphaned).append(d)
+    ...
+```
+
+**사용자가 이미 "거절"한 항목을 재분석 후 다시 물어보지 않는 것**이
+이 설계의 실질적 가치다. 대화 12개짜리 발명을 재분석할 때마다 예전에
+거절한 제안 40개를 다시 검토하라고 하면 아무도 재분석을 쓰지 않는다.
+
+### 27.4 화면 표시
+
+```
+대화 #4 재분석 결과 (분석 #2)
+
+▼ 새 항목 3           ← 이번에 새로 나온 것만 판단하면 된다
+  ☑ 핵심 아이디어 ← ...                              신뢰 94
+
+▼ 이전 판단 유지 5    ← 접혀 있음
+  ✅ 승인됨  작동 원리 ← ...          (분석 #1에서 승인)
+  ❌ 거절됨  예상 효과 ← ...          (분석 #1에서 거절: "근거 부족")
+     [다시 판단하기]
+
+▼ 이전 분석에만 있던 항목 2  ← 접혀 있음, 참고용
+  이번 분석에서는 나오지 않았습니다. 판단 기록은 보존됩니다.
+```
+
+### 27.5 왜 이게 중요한가
+
+원칙 2("AI 분석과 사용자가 승인한 내용을 구분한다")는 표시상의 문제가
+아니라 **데이터 구조의 문제**다. 한 곳에 섞어 저장하면:
+
+- 재분석이 사용자 판단을 지운다 → 재분석 기능을 못 쓴다
+- "AI가 그렇게 말했다"와 "내가 그렇게 판단했다"를 구분할 수 없다 →
+  특허 출원 시 발명자의 판단 근거를 증명할 수 없다
+- 나중에 AI 품질을 평가할 수 없다 (승인율/거절율을 계산할 수 없다)
+
+마지막 항목은 부수 효과지만 실제로 유용하다 — **승인율이 낮은
+`change_type`이나 낮은 신뢰도 구간을 찾아 프롬프트를 개선**할 수 있다.
 
 ---
 
