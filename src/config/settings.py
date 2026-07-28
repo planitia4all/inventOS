@@ -21,6 +21,12 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 load_dotenv(_PROJECT_ROOT / ".env")
 
+# VERSION 파일을 읽지 못했을 때만 쓰는 최후 기본값. VERSION 파일을 올릴 때
+# 이 값도 함께 올린다 (테스트가 두 값의 일치를 강제하지는 않는다 — 이건
+# 파일이 없는 비정상 상황용 표시일 뿐이다).
+_FALLBACK_VERSION = "0.5.0-dev.1"
+
+
 def _load_app_version() -> str:
     """프로젝트 루트의 `VERSION` 파일을 유일한 버전 원본으로 삼는다.
 
@@ -32,7 +38,7 @@ def _load_app_version() -> str:
         return (_PROJECT_ROOT / "VERSION").read_text(encoding="utf-8").strip()
     except OSError as exc:
         logger.warning("VERSION 파일을 읽지 못해 기본값을 사용합니다: %s", exc)
-        return "0.4.0-rc.1"
+        return _FALLBACK_VERSION
 
 
 # 설정 화면 "앱 정보"/README에 표시하는 버전. 사용자에게 보여주는 용도일 뿐

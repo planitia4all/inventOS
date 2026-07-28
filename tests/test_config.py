@@ -58,12 +58,13 @@ def test_app_version_matches_version_file():
     assert APP_VERSION == file_value
 
 
-def test_app_version_is_marked_as_release_candidate():
-    assert "-rc." in APP_VERSION
+def test_app_version_is_marked_as_prerelease():
+    """정식 릴리스 전에는 -rc.N(릴리스 후보) 또는 -dev.N(개발 중) 표시가 붙는다."""
+    assert "-rc." in APP_VERSION or "-dev." in APP_VERSION
 
 
 def test_load_app_version_falls_back_when_file_missing(tmp_path, monkeypatch):
     import src.config.settings as settings_module
 
     monkeypatch.setattr(settings_module, "_PROJECT_ROOT", tmp_path)
-    assert _load_app_version() == "0.4.0-rc.1"
+    assert _load_app_version() == settings_module._FALLBACK_VERSION
