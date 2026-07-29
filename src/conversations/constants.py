@@ -100,3 +100,53 @@ STANCE_PRIORITY: tuple[str, ...] = (
     "user_deferred",
     "user_rejected",
 )
+
+
+# ---------------------------------------------------------------------------
+# ConversationImport 컬럼 값 (1단계, §18)
+# ---------------------------------------------------------------------------
+# DB Native Enum을 쓰지 않고 문자열 + Python 검증으로 둔다 — 값이 하나
+# 늘어날 때마다 Migration을 돌려야 하는 상황을 피하기 위해서다.
+
+ANALYSIS_STATUS_PENDING = "pending"
+ANALYSIS_STATUS_ANALYZING = "analyzing"
+ANALYSIS_STATUS_ANALYZED = "analyzed"
+ANALYSIS_STATUS_FAILED = "failed"
+ANALYSIS_STATUS_NEEDS_REANALYSIS = "needs_reanalysis"
+
+ANALYSIS_STATUSES: tuple[str, ...] = (
+    ANALYSIS_STATUS_PENDING,
+    ANALYSIS_STATUS_ANALYZING,
+    ANALYSIS_STATUS_ANALYZED,
+    ANALYSIS_STATUS_FAILED,
+    ANALYSIS_STATUS_NEEDS_REANALYSIS,
+)
+
+SUMMARY_STATUS_NOT_GENERATED = "not_generated"
+SUMMARY_STATUS_VALID = "valid"
+SUMMARY_STATUS_NEEDS_REGENERATION = "needs_regeneration"
+SUMMARY_STATUS_FAILED = "failed"
+
+SUMMARY_STATUSES: tuple[str, ...] = (
+    SUMMARY_STATUS_NOT_GENERATED,
+    SUMMARY_STATUS_VALID,
+    SUMMARY_STATUS_NEEDS_REGENERATION,
+    SUMMARY_STATUS_FAILED,
+)
+
+# 요약 체인 검증 결과 (§10). summary_status와 값이 겹치지만 다른 개념이다 —
+# 이쪽은 "지금 검사해 보니 이렇더라"는 계산 결과고, summary_status는
+# 레코드에 저장된 상태다.
+CHAIN_VALID = "valid"
+CHAIN_MISSING_PREVIOUS = "missing_previous"
+CHAIN_BEFORE_HASH_MISMATCH = "before_hash_mismatch"
+CHAIN_MISSING_AFTER_SUMMARY = "missing_after_summary"
+CHAIN_NEEDS_REGENERATION = "needs_regeneration"
+
+# 원문 중복 검사 결과 (§6).
+DUPLICATE_NEW = "new"
+DUPLICATE_SAME_INVENTION = "exact_duplicate_same_invention"
+DUPLICATE_OTHER_INVENTION = "exact_duplicate_other_invention"
+
+# 대화 출처.
+SOURCE_TYPES: tuple[str, ...] = ("chatgpt", "claude", "other", "file")

@@ -9,7 +9,6 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from src.config.settings import Settings, get_settings
 from src.database.migrations import run_migrations
-from src.database.models import Base
 
 _engine = None
 _SessionLocal: sessionmaker | None = None
@@ -36,8 +35,10 @@ def init_engine(settings: Settings | None = None):
         f"sqlite:///{settings.db_path}",
         connect_args={"check_same_thread": False},
     )
-    Base.metadata.create_all(_engine)
-    # 기존 DB에 나중에 추가된 컬럼을 채워 넣는다 (데이터 보존).
+    # 테이블 생성과 컬럼 보충을 모두 run_migrations()가 한다 (데이터 보존).
+    # 스키마를 바꾸기 전에 백업을 먼저 만들어야 하므로, 순서를 한 곳에서
+    # 관리한다 — 여기서 create_all을 먼저 부르면 새 테이블이 생기는
+    # 마이그레이션에서 백업이 만들어지기 전에 스키마가 바뀌어 버린다.
     run_migrations(_engine)
     _SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False)
     return _engine

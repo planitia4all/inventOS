@@ -32,6 +32,7 @@ AST 계약 테스트가 이 규칙을 자동으로 강제한다.
 from __future__ import annotations
 
 import copy
+import json
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 
@@ -146,6 +147,9 @@ class AnalysisKeys:
     APPLIED_TEXT = "applied_text"
     EVENT_ID = "event_id"
     ERROR_MESSAGE = "error_message"
+
+    # 깨진 JSON을 그대로 보존할 때 원문을 담는 자리 (`_unmigrated_raw` 안).
+    CORRUPTED_TEXT = "corrupted_text"
 
 
 # ai_analysis 안에서 "제안 항목" 형태를 갖는 버킷들
@@ -1362,6 +1366,52 @@ def load_analysis(raw: dict | None) -> AnalysisDocument:
 
     errors: list[str] = []
     return AnalysisDocument(normalize_v1(work, errors), errors)
+
+
+# ---------------------------------------------------------------------------
+# DB 직렬화 — TEXT 컬럼과의 유일한 접점
+# ---------------------------------------------------------------------------
+
+
+def dumps_analysis(doc: "AnalysisDocument | dict | None") -> str | None:
+    """`analysis_json` TEXT 컬럼에 넣을 문자열로 만든다.
+
+    직렬화 옵션이 **계약의 일부다.**
+
+    - ``ensure_ascii=False`` — 한글이 ``\\uXXXX``로 부풀지 않는다. DB를
+      직접 열어 봤을 때 사람이 읽을 수 있어야 한다.
+    - ``sort_keys=True`` — 같은 내용이면 항상 같은 문자열이 나온다.
+      "내용이 바뀌었나"를 문자열 비교만으로 판단할 수 있다.
+    - ``separators=(",", ":")`` — 불필요한 공백을 넣지 않는다. 들여쓰기는
+      화면에 보여줄 때만 쓰고 DB에는 저장하지 않는다.
+
+    셋 중 하나라도 빠지면 내용이 같은데 문자열이 달라져서, 변경 감지와
+    테스트가 조용히 어긋난다.
+    """
+    if doc is None:
+        return None
+    data = doc.to_json() if isinstance(doc, AnalysisDocument) else doc
+    return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def loads_analysis(text: str | None) -> AnalysisDocument:
+    """`analysis_json` TEXT 컬럼을 읽어 문서로 되돌린다.
+
+    **깨진 JSON이 저장돼 있어도 예외를 던지지 않는다.** 대화 목록을 여는
+    것만으로 앱 전체가 멈추면 안 되기 때문이다. 해석에 실패하면 원문
+    문자열을 `_unmigrated_raw`에 그대로 담아 돌려주므로, 나중에 원인을
+    찾거나 손으로 복구할 수 있다 — 이 경우 `is_unmigrated`가 True다.
+    """
+    if text is None or not text.strip():
+        return AnalysisDocument(empty_analysis(), [])
+    try:
+        raw = json.loads(text)
+    except ValueError as exc:
+        return AnalysisDocument(
+            _wrap_unknown({AnalysisKeys.CORRUPTED_TEXT: text}),
+            [f"analysis_json을 해석하지 못해 원본을 보존했습니다: {exc}"],
+        )
+    return load_analysis(raw)
 
 
 def iter_items(ai_analysis: dict) -> Iterator[dict]:

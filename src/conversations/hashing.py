@@ -131,6 +131,35 @@ def hash_message(role: str, text: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def normalize_summary_text(text: str) -> str:
+    """누적 요약 해시 계산용 정규화. **의미 정규화를 하지 않는다.**
+
+    BOM 제거 · 줄바꿈 통일 · 앞뒤 공백 제거, 그게 전부다.
+
+    `normalize_raw_content()`나 `normalize_item_text()`를 쓰지 않는 이유:
+    저쪽은 UI 부스러기를 지우고 동의어를 치환하고 조사를 뗀다. 요약문에
+    그걸 적용하면 **저장된 요약 원문과 해시가 직접 대응하지 않게 되어**
+    체인이 깨졌는지 검증할 수 없게 된다. 요약 해시는 "이 글자 그대로였나"를
+    확인하는 무결성 해시지, 의미 비교용이 아니다 — 원문 무결성 해시와
+    item_id 정규화를 혼동하면 안 된다.
+    """
+    if not text:
+        return ""
+    s = text.replace(_BOM, "")
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    return s.strip()
+
+
+def hash_summary_text(text: str | None) -> str | None:
+    """누적 요약(`rolling_summary_after`)의 SHA-256. 내용이 없으면 None."""
+    if text is None:
+        return None
+    normalized = normalize_summary_text(text)
+    if not normalized:
+        return None
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # item_id 정규화 (§27.2.1)
 # ---------------------------------------------------------------------------
