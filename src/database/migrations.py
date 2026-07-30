@@ -68,15 +68,48 @@ def run_migrations(engine: Engine) -> list[str]:
 
     반환값은 실제로 추가한 컬럼 이름 목록이다 (데이터 마이그레이션은
     포함하지 않는다 — 그건 로그로만 남긴다).
+
+    **순서가 중요하다**: 스키마를 바꾸기 전에 백업을 먼저 만든다. 테이블
+    생성(`create_all`)도 여기서 한다 — 예전에는 `init_engine()`이 먼저
+    호출해서, 새 테이블이 생기는 마이그레이션에서는 백업이 만들어지기
+    **전에** 스키마가 이미 바뀌어 있었다.
     """
-    if _needs_column_migration(engine):
+    if _needs_schema_migration(engine):
         _backup_db_file(engine)
+    _create_missing_tables(engine)
     applied = _add_missing_columns(engine)
     _remap_legacy_status_values(engine)
     _backfill_tags_from_keywords(engine)
     _backfill_ai_result_status(engine)
     _ensure_search_index(engine)
     return applied
+
+
+def _create_missing_tables(engine: Engine) -> None:
+    """모델에 있는데 DB에 없는 테이블(과 그 인덱스)을 만든다.
+
+    `create_all`은 이미 있는 테이블을 건드리지 않으므로 여러 번 실행해도
+    안전하다. `conversation_imports`처럼 나중에 추가된 테이블은 기존
+    사용자 DB를 열 때 여기서 만들어진다.
+    """
+    from src.database.models import Base
+
+    Base.metadata.create_all(engine)
+
+
+def _needs_schema_migration(engine: Engine) -> bool:
+    """실제로 스키마가 바뀌는지 미리 확인한다 (백업 여부 판단용).
+
+    컬럼 추가(ALTER TABLE)뿐 아니라 **테이블 추가**도 포함한다.
+    """
+    return _needs_new_table(engine) or _needs_column_migration(engine)
+
+
+def _needs_new_table(engine: Engine) -> bool:
+    from src.database.models import Base
+
+    existing = set(inspect(engine).get_table_names())
+    return bool(set(Base.metadata.tables) - existing)
 
 
 def _needs_column_migration(engine: Engine) -> bool:

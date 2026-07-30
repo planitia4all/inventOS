@@ -1365,86 +1365,125 @@ OCR·비전 분석은 범위 밖이다. **이미지와 아이디어 요소의 �
 
 ### 16.2 새 테이블 1개
 
+**0.5.0-alpha에서 새로 만드는 테이블은 이것 하나뿐이다.**
+`ConversationMessage` · `IdeaElement` · `IdeaElementMention` ·
+`IdeaRelation` · `IdeaChange` · `SourceReference` · `RollingSummary`는
+**만들지 않는다.** 아이디어 요소·출처·사용자 판단·메시지 분석 결과는
+계속 버전형 `analysis_json` 안에 둔다 (§26).
+
+테이블 승격은 아래가 **실제로** 확인될 때만 검토한다 — 미리 만들지 않는다.
+
+- 여러 발명을 가로지르는 Idea Element 검색이 필요해짐
+- 특정 개념 기준 통계가 반복적으로 필요해짐
+- JSON 집계 성능이 실제로 문제가 됨
+- 개별 Element의 독립적인 수정·권한·수명 관리가 필요해짐
+- 발명당 대화 수가 설계 예상(20건)보다 크게 늘어남
+
+구현: `src/database/models.py::ConversationImport`
+
 ```python
 class ConversationImport(Base):
-    """붙여넣은 대화 한 건과 그 분석 결과.
-
-    검색·정렬·필터링에 쓰이는 값은 전부 정규 컬럼이다.
-    analysis_json에는 '조회 축이 아닌' 분석 내용만 들어간다 (§26).
-    """
     __tablename__ = "conversation_imports"
 
     # --- 식별 / 소속 ---
-    id:                str            # uuid
-    invention_id:      str            # FK → inventions.id, ondelete="CASCADE"
-    sequence_no:       int            # 발명별 1,2,3...  (invention_id, sequence_no) UNIQUE
+    id:                str            # uuid (기존 테이블과 같은 정책)
+    invention_id:      str            # FK → inventions.id  (ON DELETE 절 없음)
+    sequence_no:       int            # 발명별 1,2,3...
 
     # --- 출처 ---
     title:             str
     source_type:       str            # chatgpt | claude | other | file
-    source_name:       str | None     # 파일명 등 (붙여넣기면 None)
+    source_name:       str | None
     conversation_date: date | None    # 실제 대화일 (사용자 입력)
     imported_at:       datetime
 
     # --- 원문 (§6.2) ---
-    raw_content:       str            # 사용자가 붙여넣은 그대로. 불변.
-    raw_content_hash:  str            # 정규화 후 SHA-256 (§6.4). INDEX
-    char_count:        int
-    turn_count:        int
+    raw_content:        str           # 붙여넣은 그대로. 자동으로 자르지 않는다.
+    raw_content_hash:   str           # 정규화 후 SHA-256 (§6.4)
+    raw_content_length: int           # Python 문자열 길이(코드포인트). 바이트 아님.
 
     # --- 분석 ---
-    analysis_status:   str            # 대기 | 분석중 | 분석됨 | 분석실패
-                                      # | 일부반영 | 반영완료 | 보관됨
-    analysis_json:     dict | None    # §26 스키마
+    analysis_status:   str            # pending | analyzing | analyzed
+                                      # | failed | needs_reanalysis
+    analysis_json:     str | None     # §26 스키마를 결정론적으로 직렬화한 TEXT
     analysis_schema_version: str      # "1.0"
+    analysis_version:  int            # 재분석할 때마다 +1. 0이면 분석 전.
     provider:          str            # mock | anthropic
     model:             str | None
-    prompt_version:    str            # "conversation-analysis-1.0"
+    prompt_version:    str
+    synonym_dict_version: int         # 해시 입력 아님 — remap 판단용 (§27.2.2)
 
     # --- 누적 요약 체인 (§5.2.2) — 별도 테이블 없이 여기에 보존 ---
-    previous_conversation_import_id: str | None  # 체인의 이전 고리
+    previous_conversation_import_id: str | None  # FK → 자기 테이블
     rolling_summary_before_hash: str | None      # 어느 요약 위에 얹었는가
-    rolling_summary_after:       str | None      # 이 대화까지의 요약 (= Summary vN)
+    rolling_summary_after:       str | None      # 이 대화까지의 요약
     rolling_summary_after_hash:  str | None      # 다음 대화가 검증할 값
-    summary_chain_status: str                    # ok | broken | needs_regeneration
+    summary_status: str              # not_generated | valid
+                                     # | needs_regeneration | failed
 
-    # --- 부분 중복 (§6.5) ---
-    overlap_match_type:      str | None   # identical | superset | partial_overlap | unrelated
-    overlap_with_import_id:  str | None
-    analyzed_range_start:    int | None   # 실제로 분석한 메시지 구간
-    analyzed_range_end:      int | None
+    # --- 부분 중복 (§6.5). 판정은 Parser 단계에서 채운다 ---
+    overlap_type:           str | None  # exact_duplicate | superset
+                                        # | partial_overlap | new
+    overlap_with_import_id: str | None  # FK → 자기 테이블
+    new_message_start:      int | None  # 실제로 새로 분석한 구간
+    new_message_count:      int | None
 
     # --- 반영 결과 ---
-    applied_at:        datetime | None
-    created_revision_id: str | None   # FK → invention_revisions.id
-    created_event_id:  str | None     # 대표 Timeline 이벤트 (나머지는 meta 역참조)
-
-    # --- 재분석 ---
-    reanalysis_of:     str | None     # 재분석이면 원본 import id
+    applied_at:          datetime | None
+    created_revision_id: str | None   # FK → invention_revisions.id (SET NULL)
+    created_event_id:    str | None   # FK → invention_events.id    (SET NULL)
 
     # --- 삭제 (§28) ---
-    deleted_at:        datetime | None   # Soft Delete. NULL이면 살아 있음
+    is_deleted: bool                  # 기본 False
+    deleted_at: datetime | None
 
-    created_at:        datetime
-    updated_at:        datetime
+    created_at: datetime
+    updated_at: datetime
 ```
 
 **필수 정규 컬럼** (이것만은 JSON에 넣지 않는다):
 `invention_id` · `sequence_no` · `raw_content` · `raw_content_hash` ·
-`analysis_status` · `analysis_schema_version` · `provider` / `model` ·
-`prompt_version` · `previous_conversation_import_id` ·
+`analysis_status` · `analysis_json` · `analysis_schema_version` ·
+`analysis_version` · `provider` · `model` · `prompt_version` ·
+`synonym_dict_version` · `previous_conversation_import_id` ·
 `rolling_summary_before_hash` / `rolling_summary_after` /
-`rolling_summary_after_hash` · `deleted_at` · `created_at` · `applied_at`
+`rolling_summary_after_hash` · `is_deleted` · `created_at` · `updated_at`
 
-**인덱스**
+**인덱스와 제약**
 
-| 인덱스 | 용도 |
-|---|---|
-| `(invention_id, sequence_no)` UNIQUE | 회차 정렬 + 중복 회차 방지 |
-| `raw_content_hash` | 중복 Import 검사 1단계 (§6.4) |
-| `(invention_id, analysis_status)` | "미반영 대화 있음" 배지 |
-| `(invention_id, deleted_at)` | 삭제되지 않은 대화만 목록 (§28) |
-| `previous_conversation_import_id` | 요약 체인 역추적 (§5.2.2) |
+| 이름 | 종류 | 용도 |
+|---|---|---|
+| `uq_conversation_import_seq` | UNIQUE `(invention_id, sequence_no)` | 회차 중복 방지 |
+| `ck_conversation_import_prev_not_self` | CHECK | 자기 자신을 이전 고리로 지정 금지 |
+| `ix_conversation_import_invention_hash` | INDEX `(invention_id, raw_content_hash)` | 같은 발명 안 중복 검사 |
+| `ix_conversation_import_hash` | INDEX `(raw_content_hash)` | 다른 발명에 같은 원문이 있는지 |
+| `ix_conversation_import_invention_deleted` | INDEX `(invention_id, is_deleted)` | 삭제되지 않은 대화 목록 (§28) |
+| `ix_conversation_import_previous` | INDEX `(previous_conversation_import_id)` | 요약 체인 역추적 (§5.2.2) |
+
+**`raw_content_hash`에 UNIQUE를 걸지 않는 이유**: 사용자가 같은 대화를
+일부러 다시 저장하고 싶을 수 있다. 중복은 **경고**지 금지가 아니다.
+서비스가 `new` / `exact_duplicate_same_invention` /
+`exact_duplicate_other_invention`을 돌려주고, 저장 여부는 사용자가 정한다.
+
+**`invention_id` FK에 `ON DELETE` 절을 달지 않은 이유**: DB가 조용히
+연쇄 삭제하면 "무엇이 함께 사라지는지 먼저 보여준다"는 영구 삭제 정책을
+우회하게 된다. 대신 ORM 관계(`Invention.conversation_imports`)의 cascade가
+영구 삭제 시 명시적으로 함께 지운다 — 삭제 경로가 서비스 한 곳으로 모인다.
+발명을 **휴지통에 넣는 것**(Soft Delete)은 대화에 아무 영향이 없다.
+
+**`sequence_no` 생성**: 잠금 없이 `max+1`로 계산하고, UNIQUE 제약에
+부딪히면 다시 계산해서 재시도한다(최대 5회, SAVEPOINT로 감싸 바깥
+트랜잭션을 깨뜨리지 않는다). 발명번호 생성과 같은 방식이다. **삭제된
+회차까지 포함해서** 최대값을 구하므로 번호가 재사용되지 않는다.
+
+**`analysis_json` 직렬화**는 다음으로 고정한다 (§26.4).
+
+```python
+json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+```
+
+JSON 타입 컬럼이 아니라 TEXT인 이유는 키 순서까지 고정해야 변경 감지와
+비교가 안정적이기 때문이다.
 
 > 메시지 단위 해시(§6.5)는 `analysis_json.messages`에 있어 인덱스를
 > 걸 수 없다. 발명당 대화 20개 × 메시지 100개 = 2,000건 규모라
@@ -2622,6 +2661,31 @@ class AnalysisDocument:
         """AI 결과만 갈아끼우고 사용자 판단은 이어받는다 (§27.3)."""
 ```
 
+**DB와의 접점도 이 파일에만 둔다.** TEXT 컬럼과 문서 사이를 오가는
+함수는 두 개뿐이다.
+
+```python
+def dumps_analysis(doc) -> str | None:
+    """TEXT 컬럼에 넣을 문자열. 직렬화 옵션이 계약의 일부다."""
+    return json.dumps(data, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"))
+
+
+def loads_analysis(text: str | None) -> AnalysisDocument:
+    """깨진 JSON이 저장돼 있어도 예외를 던지지 않는다.
+
+    대화 목록을 여는 것만으로 앱 전체가 멈추면 안 된다. 해석에 실패하면
+    원문 문자열을 `_unmigrated_raw.corrupted_text`에 그대로 담아 돌려주므로
+    나중에 손으로 복구할 수 있다.
+    """
+```
+
+| 옵션 | 없으면 생기는 일 |
+|---|---|
+| `ensure_ascii=False` | 한글이 `\uXXXX`로 부풀어 DB를 열어도 못 읽는다 |
+| `sort_keys=True` | 내용이 같은데 문자열이 달라져 변경 감지가 어긋난다 |
+| `separators=(",", ":")` | 불필요한 공백이 끼어 같은 문제가 생긴다 |
+
 ### 26.5 버전 마이그레이션 체인
 
 ```python
@@ -2717,65 +2781,109 @@ def test_analysis_json_keys_are_not_referenced_outside_schema_module():
 item_id = sha256(change_type | target_field | normalized_text)[:16]
 ```
 
-#### 27.2.1 normalized_text 정규화 6단계
+#### 27.2.1 normalized_text 정규화 9단계
 
 표현만 살짝 다른 같은 제안이 다른 id가 되지 않도록, 해시 계산 전에
 아래 순서로 정규화한다. **표시용 `text`는 원문 그대로 보존한다.**
 
-```python
-def normalize_for_item_id(text: str, synonyms: SynonymDict) -> str:
-    # 1) 공백·줄바꿈 통합
-    s = re.sub(r"\s+", " ", text).strip()
-    # 2) 문장부호·목록기호 제거  (- • 1. 가. 등)
-    s = re.sub(r"^[\-•*▪□○●]+\s*", "", s)
-    s = re.sub(r"^\d+[.)]\s*", "", s)
-    s = re.sub(r"[.,;:!?()\[\]{}\"'`~]", "", s)
-    # 3) 영문 대소문자 통합 + 전각/반각
-    s = unicodedata.normalize("NFKC", s).lower()
-    # 4) 대표 용어 치환 (내장 약어 사전, §10.4)
-    s = apply_builtin_abbreviations(s)
-    # 5) 사용자 동의어 사전 적용
-    s = synonyms.to_canonical(s)
-    # 6) 불필요한 반복 표현 제거
-    s = re.sub(r"\b(\w+)( \1\b)+", r"\1", s)      # 같은 단어 연속
-    s = _FILLER.sub("", s)   # "그러니까", "말하자면", "결국" 등
-    return s.strip()
+**이 순서 자체가 계약이다.** 순서를 바꾸면 같은 제안이 다른 id를 갖게
+되어 과거 사용자 판단이 전부 고아가 된다.
+
 ```
+1.   Unicode NFKC
+2.   영문 소문자화
+3.   줄바꿈·공백 통합
+4.   문장부호·목록기호 제거
+4.5  한국어 조사 제거
+5.   내장 약어·대표 용어 치환
+6.   사용자 동의어 치환
+6.5  한국어 조사 재제거
+7.   군더더기·반복 표현 정리
+```
+
+구현: `src/conversations/hashing.py::normalize_item_text()`
 
 | 단계 | 흡수하는 차이 |
 |---|---|
-| 1 공백 | `"A  B"` ↔ `"A B"` ↔ `"A\nB"` |
-| 2 문장부호·목록기호 | `"- 그래핀 섬유."` ↔ `"그래핀 섬유"` |
-| 3 대소문자·전각 | `"Graphene Fiber"` ↔ `"graphene fiber"` |
-| 4 대표 용어 | `"Through Glass Via"` ↔ `"TGV"` |
-| 5 사용자 동의어 | `"그래핀 실"` ↔ `"그래핀 섬유"` |
-| 6 반복·군더더기 | `"결국 그래핀 섬유"` ↔ `"그래핀 섬유"` |
+| 1 NFKC | `"（Ａ）"` ↔ `"(A)"` — **전각 문장부호를 4단계가 지울 수 있게 먼저** |
+| 2 소문자 | `"Graphene Fiber"` ↔ `"graphene fiber"` |
+| 3 공백 | `"A  B"` ↔ `"A B"` ↔ `"A\nB"` |
+| 4 문장부호·목록기호 | `"- 그래핀 섬유."` ↔ `"그래핀 섬유"` |
+| 4.5 조사 | `"그래핀은"` ↔ `"그래핀"` |
+| 5 대표 용어 | `"Through Glass Via"` ↔ `"TGV"` |
+| 6 사용자 동의어 | `"그래핀 실"` ↔ `"그래핀 섬유"` |
+| 6.5 조사 재제거 | `"그래핀 섬유을"` → `"그래핀 섬유"` (치환이 만든 어색한 조사) |
+| 7 반복·군더더기 | `"결국 그래핀 섬유"` ↔ `"그래핀 섬유"` |
+
+**1·2단계가 3·4단계보다 앞인 이유**: NFKC가 전각 문장부호(`．` `，`
+`（`)를 ASCII로 바꾼 **뒤에** 문장부호를 지워야 전각도 걸린다. 반대
+순서면 전각 문장부호가 살아남아 `"그래핀 섬유．"`와 `"그래핀 섬유."`가
+다른 id가 된다.
+
+**조사 제거 안전 원칙** (§10.4의 규칙을 여기서도 그대로 따른다)
+
+- 최소 어간 길이 **2자** — 떼고 남는 어간이 2자 미만이면 떼지 않는다
+- **과잉 제거보다 미제거를 우선한다** — 잘못 뗀 것은 되돌릴 방법이 없다
+- `정도` · `온도` · `재료` · `유리` 같은 일반 명사를 훼손하지 않는다
+  (전부 2자 가드에 걸려 보존된다)
+- 사용자 동의어 치환 뒤 조사 형태가 어색해진 경우는 **6.5단계**가 처리한다
+
+**왜 조사를 두 번 떼는가** — 한국어 조사는 앞 음절의 받침에 따라
+형태가 바뀌기 때문에, 조사를 남긴 채 동의어를 치환하면 반드시 어긋난다.
+
+```
+"그래핀 실을 사용"    → 6단계 치환 → "그래핀 섬유을 사용"   (받침 있음 → 을)
+"그래핀 섬유를 사용"  → 치환 없음   → "그래핀 섬유를 사용"   (받침 없음 → 를)
+                     → 같은 뜻인데 item_id가 다르다
+```
+
+4.5단계만으로는 이 예가 해결되지 않는다. `"실을"`은 떼고 남는 어간이
+1자(`"실"`)라 2자 가드가 막기 때문이다. 치환으로 `"섬유을"`이 되고
+나서야 어간이 2자가 되어 뗄 수 있다. **두 번 돌리면 양쪽 모두
+`"그래핀 섬유 사용"`으로 수렴한다.**
 
 #### 27.2.2 함정 — 동의어 사전이 바뀌면 item_id가 바뀐다
 
-5단계에서 **사용자 동의어 사전을 쓰기 때문에**, 사용자가 나중에
+6단계에서 **사용자 동의어 사전을 쓰기 때문에**, 사용자가 나중에
 `"전도성 섬유"`를 `"그래핀 섬유"`에 병합하면 **과거 item_id가 전부
 달라진다.** 아무 대비 없이 두면 그 순간 모든 사용자 판단이 고아가 된다.
 
-**대응**
+**`synonym_dict_version`은 해시 입력에 넣지 않는다.**
 
-1. `analysis_json.synonym_dict_version`에 **어떤 사전으로 계산했는지**
-   함께 저장한다 (§26.2).
-2. 사전이 바뀌면 즉시 재계산하지 않는다. 다음에 그 발명을 열 때
-   **일괄 remap**을 한 번 수행한다.
-3. remap은 `(old_item_id → new_item_id)` 매핑을 만들어 `user_review`의
-   판단을 그대로 옮기고, 이력을 `related_previous_item_id`에 남긴다.
+```
+item_id = sha256(change_type | target_field | normalized_text)[:16]
+```
+
+넣고 싶은 유혹이 있지만 넣으면 안 된다 — 사전을 한 번 고치는 순간
+**내용이 전혀 바뀌지 않은 항목까지 전부 새 id를 갖게 되어**, remap이
+막으려던 바로 그 사고가 사전을 고칠 때마다 일어난다. 사전이 실제로
+영향을 준 항목은 5·6단계 **결과**가 달라져 자연히 다른 id가 되고,
+영향받지 않은 항목은 id가 그대로 유지되어야 한다.
+
+버전은 대신 다음 네 가지에만 쓴다.
+
+1. **추적** — 이 분석이 어떤 사전으로 정규화됐는지 기록
+   (`analysis_json.synonym_dict_version`, §26.2)
+2. **변경 감지** — 저장된 버전과 현재 버전을 비교해 remap 필요 여부 판단
+3. **결정론적 Remap 실행** — AI 호출 없이 `(old_item_id → new_item_id)`
+   매핑을 계산해 `user_review`의 판단을 옮긴다
+4. **충돌 보고** — 옮길 수 없는 경우를 사용자에게 보여준다
+
+사전이 바뀌어도 즉시 재계산하지 않는다. 다음에 그 발명을 열 때
+**일괄 remap**을 한 번 수행한다.
 
 ```python
-def remap_item_ids(doc: AnalysisDocument, new_dict: SynonymDict) -> AnalysisDocument:
-    """동의어 사전이 바뀌었을 때 판단을 새 item_id로 옮긴다."""
-    mapping = {
-        item.item_id: make_item_id(item.change_type, item.target_field,
-                                   normalize_for_item_id(item.text, new_dict))
-        for item in doc.all_items()
-    }
-    return doc.with_remapped_decisions(mapping, new_dict.version)
+def remap_item_ids(items, decisions, new_synonym_map, new_version):
+    """동의어 사전이 바뀌었을 때 판단을 새 item_id로 옮긴다.
+
+    판단이 서로 일치할 때만 자동 이관한다. 옛 id 둘이 새 id 하나로
+    합쳐지는데 판단이 서로 다르면(하나는 승인, 하나는 거부) 아무것도
+    옮기지 않고 conflicts로 돌려준다 — 사용자가 직접 고른다.
+    """
 ```
+
+구현: `src/conversations/hashing.py::remap_item_ids()` →
+`RemapResult(mapping, migrated, conflicts, unchanged)`
 
 이 remap은 **결정론적이고 AI 호출이 없다.** 사전 버전만 비교하면
 언제 돌려야 하는지 알 수 있다.
@@ -3033,7 +3141,7 @@ def mark_chain_after(session, deleted: ConversationImport) -> list[str]:
 2. **스키마** — `schema_version` 필수, 3계층(`ai_analysis`/`user_review`/
    `application_result`) + `messages` + `overlap`.
 3. **item_id** — `sha256(change_type|target_field|normalized_text)`,
-   정규화 6단계, `synonym_dict_version` 동반 기록.
+   정규화 9단계, `synonym_dict_version` 동반 기록(해시 입력 아님).
 4. **재분석** — 동일 id는 유지, 유사는 **질문**, 신규는 미검토.
    유사하다고 승인을 자동 복사하지 않는다.
 5. **메시지 중복** — 전체 해시(1단계) + 메시지 해시·유사도(2단계).

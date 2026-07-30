@@ -14,7 +14,20 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import JSON, Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, event
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    CheckConstraint,
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    event,
+)
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -131,6 +144,14 @@ class Invention(Base):
     )
     tag_links: Mapped[list["InventionTag"]] = relationship(
         back_populates="invention", cascade="all, delete-orphan"
+    )
+    # 붙여넣은 AI 대화 기록. cascade에 delete가 들어 있어서 발명을 **영구**
+    # 삭제하면 대화도 함께 사라진다 — 휴지통(소프트 삭제)에서는 아무 영향이
+    # 없다. DB의 FK 자체에는 ON DELETE 절을 달지 않았다(아래 클래스 주석).
+    conversation_imports: Mapped[list["ConversationImport"]] = relationship(
+        back_populates="invention",
+        cascade="all, delete-orphan",
+        foreign_keys="[ConversationImport.invention_id]",
     )
 
     # cascade에 "delete"를 넣지 않는다 — 부모를 지운다고 파생된 자식
@@ -424,3 +445,142 @@ class Attachment(Base):
 
     invention: Mapped["Invention"] = relationship(back_populates="attachments")
     experiment: Mapped["Experiment | None"] = relationship(back_populates="attachments")
+
+
+class ConversationImport(Base):
+    """붙여넣은 AI 대화 한 건과 그 분석 결과 (Conversation Engine 1단계).
+
+    설계 문서 `docs/conversation-engine-design.md` §16.2.
+
+    이 테이블이 필요한 이유
+    -----------------------
+    대화 목록·회차 정렬·반영 상태 조회·중복 해시 검사는 전부 기본
+    기능인데, 이걸 JSON 안에만 넣으면 목록 화면조차 JSON 파싱으로
+    만들어야 하고 해시 검사에 전체 스캔이 필요하다. 반대로 아이디어
+    요소·질문·사용자 판단 같은 **분석 내용은 조회 축이 아니므로**
+    `analysis_json` 하나로 충분하다 — 그래서 0.5.0-alpha에서 새로 만드는
+    테이블은 이것 **하나뿐**이다. IdeaElement/SourceReference/
+    RollingSummary 같은 테이블은 만들지 않는다.
+
+    삭제 정책 (§28)
+    ---------------
+    기본은 Soft Delete(`is_deleted`)다. 원문 행·회차 번호·Revision/Event
+    연결이 전부 남아 있어 복원하면 같은 자리로 돌아온다.
+
+    `invention_id` FK에는 일부러 `ondelete=` 절을 달지 않았다. DB가 조용히
+    연쇄 삭제해 버리면 "무엇이 함께 사라지는지 먼저 보여준다"는 이 프로젝트의
+    영구 삭제 정책을 우회하게 되기 때문이다. 대신 ORM 관계
+    (`Invention.conversation_imports`)의 cascade가 영구 삭제 시 명시적으로
+    함께 지운다 — 즉 삭제 경로가 서비스 계층 한 곳으로 모인다.
+    """
+
+    __tablename__ = "conversation_imports"
+    __table_args__ = (
+        # 발명별 회차는 겹칠 수 없다. Soft Delete된 회차 번호도 살아 있으므로
+        # 재사용되지 않는다 (행이 남아 있어 UNIQUE가 계속 막아 준다).
+        UniqueConstraint("invention_id", "sequence_no", name="uq_conversation_import_seq"),
+        # 자기 자신을 요약 체인의 이전 고리로 지정하지 못하게 DB에서 막는다.
+        # 일반 FK만으로는 막을 수 없다(자기 참조도 유효한 FK다).
+        CheckConstraint(
+            "previous_conversation_import_id IS NULL "
+            "OR previous_conversation_import_id <> id",
+            name="ck_conversation_import_prev_not_self",
+        ),
+        Index("ix_conversation_import_invention_hash", "invention_id", "raw_content_hash"),
+        Index("ix_conversation_import_hash", "raw_content_hash"),
+        Index("ix_conversation_import_invention_deleted", "invention_id", "is_deleted"),
+        Index("ix_conversation_import_previous", "previous_conversation_import_id"),
+    )
+
+    # --- 식별 / 소속 ---
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    invention_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("inventions.id"), nullable=False
+    )
+    # 발명별 회차(1, 2, 3...). 발명이 다르면 각각 1부터 시작한다.
+    sequence_no: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # --- 출처 ---
+    title: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    # chatgpt | claude | other | file. 자유 문자열이라 종류가 늘어도
+    # 스키마를 바꿀 필요가 없다.
+    source_type: Mapped[str] = mapped_column(String(30), nullable=False, default="other")
+    source_name: Mapped[str | None] = mapped_column(String(500))
+    # 실제로 대화한 날 (사용자 입력). 붙여넣은 날(imported_at)과 다를 수 있다.
+    conversation_date: Mapped[date | None] = mapped_column(Date)
+    imported_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    # --- 원문 (§6.2) ---
+    # 사용자가 붙여넣은 그대로. 절대 자동으로 자르거나 고치지 않는다.
+    raw_content: Mapped[str] = mapped_column(Text, nullable=False)
+    # 줄바꿈/공백만 정규화한 뒤의 SHA-256 (§6.4). 의미 정규화는 하지 않는다.
+    raw_content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Python 문자열 길이(유니코드 코드포인트 수). 바이트 수가 아니다.
+    raw_content_length: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # --- 분석 ---
+    # pending | analyzing | analyzed | failed | needs_reanalysis
+    analysis_status: Mapped[str] = mapped_column(String(30), nullable=False, default="pending")
+    # §26 스키마의 JSON을 결정론적 문자열로 직렬화해 저장한다 (JSON 타입이
+    # 아니라 TEXT인 이유: 키 순서까지 고정해야 해시·비교가 안정적이다).
+    analysis_json: Mapped[str | None] = mapped_column(Text)
+    analysis_schema_version: Mapped[str] = mapped_column(String(10), nullable=False, default="1.0")
+    # 같은 대화를 다시 분석할 때마다 올라간다. 0이면 아직 분석 전.
+    analysis_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    provider: Mapped[str] = mapped_column(String(50), nullable=False, default="mock")
+    model: Mapped[str | None] = mapped_column(String(100))
+    prompt_version: Mapped[str] = mapped_column(String(50), nullable=False, default="")
+    # 이 분석을 어떤 동의어 사전으로 정규화했는지 (§27.2.2).
+    # item_id 해시 입력에는 들어가지 않는다 — remap 판단에만 쓴다.
+    synonym_dict_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # --- 누적 요약 체인 (§5.2.2) — 별도 테이블 없이 여기에 보존 ---
+    previous_conversation_import_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("conversation_imports.id"), nullable=True
+    )
+    # 이 대화가 "어느 요약 위에" 얹혔는지. 이전 대화의 after_hash와 같아야 한다.
+    rolling_summary_before_hash: Mapped[str | None] = mapped_column(String(64))
+    rolling_summary_after: Mapped[str | None] = mapped_column(Text)
+    rolling_summary_after_hash: Mapped[str | None] = mapped_column(String(64))
+    # not_generated | valid | needs_regeneration | failed
+    summary_status: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="not_generated"
+    )
+
+    # --- 부분 중복 (§6.5). 판정 자체는 Parser 단계에서 채운다 ---
+    # exact_duplicate | superset | partial_overlap | new
+    overlap_type: Mapped[str | None] = mapped_column(String(30))
+    overlap_with_import_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("conversation_imports.id"), nullable=True
+    )
+    # 실제로 새로 분석한 메시지 구간 (재붙여넣기 대응).
+    new_message_start: Mapped[int | None] = mapped_column(Integer)
+    new_message_count: Mapped[int | None] = mapped_column(Integer)
+
+    # --- 반영 결과 ---
+    # 승인(analysis_json.user_review)과 반영은 별개다 — 여기가 채워져야
+    # 실제로 발명 본문에 들어간 것이다.
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_revision_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("invention_revisions.id", ondelete="SET NULL"), nullable=True
+    )
+    created_event_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("invention_events.id", ondelete="SET NULL"), nullable=True
+    )
+
+    # --- 삭제 (§28) ---
+    is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+    invention: Mapped["Invention"] = relationship(
+        back_populates="conversation_imports", foreign_keys=[invention_id]
+    )
+    previous: Mapped["ConversationImport | None"] = relationship(
+        remote_side=[id], foreign_keys=[previous_conversation_import_id]
+    )

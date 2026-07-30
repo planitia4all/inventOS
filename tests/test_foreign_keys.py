@@ -101,7 +101,12 @@ def test_orm_nullify_works_even_on_pre_existing_db_without_ondelete_clause(tmp_p
     DB에 선언된 ON DELETE 절과 무관하게 항상 안전해야 한다."""
     engine = create_engine(f"sqlite:///{tmp_path / 'pre_existing.db'}")
     with engine.begin() as conn:
-        for table in Base.metadata.sorted_tables:
+        # `sorted_tables`(FK 의존성 위상정렬)를 쓰지 않고 이름순으로 만든다.
+        # inventions ↔ experiments가 서로를 참조해서(Invention.source_experiment_id,
+        # Experiment.invention_id) 위상정렬이 불가능하고, SQLAlchemy가
+        # "unresolvable cycles" 경고를 낸다. SQLite는 CREATE TABLE 시점에
+        # 아직 없는 테이블을 FK로 가리켜도 허용하므로 순서가 필요 없다.
+        for table in sorted(Base.metadata.tables.values(), key=lambda t: t.name):
             ddl = str(CreateTable(table).compile(engine))
             ddl = re.sub(
                 r"\s+ON DELETE (SET NULL|SET DEFAULT|CASCADE|RESTRICT|NO ACTION)", "", ddl
