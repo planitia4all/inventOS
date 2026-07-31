@@ -24,7 +24,7 @@ load_dotenv(_PROJECT_ROOT / ".env")
 # VERSION 파일을 읽지 못했을 때만 쓰는 최후 기본값. VERSION 파일을 올릴 때
 # 이 값도 함께 올린다 (테스트가 두 값의 일치를 강제하지는 않는다 — 이건
 # 파일이 없는 비정상 상황용 표시일 뿐이다).
-_FALLBACK_VERSION = "0.5.0-dev.2"
+_FALLBACK_VERSION = "0.5.0-dev.3"
 
 
 def _load_app_version() -> str:
